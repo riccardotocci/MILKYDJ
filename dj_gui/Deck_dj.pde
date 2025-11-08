@@ -23,6 +23,7 @@ class Deck {
 
   float x, y, w, h;
   boolean isRightDock = false;
+  boolean sentCueHoldToSC = false;
 
   float miniX, miniY, miniW, miniH;
   float diskX, diskY, diskSize;
@@ -31,11 +32,18 @@ class Deck {
 
   float playheadSec = 0;
   float trackLengthSec = 180;
+  static final float SPEED_RANGE = 0.166f;
 
   TrackAnalysis analysis = null;
   boolean isAnalyzing = false;
   String analysisError = null;
   float bpmFallback = 120.0;
+  // --- Nuove variabili per drag continuo vinyl e mini waveform ---
+  float dragAccumulatedAngle = 0;   // accumulo angolo totale durante il drag vinyl
+  float lastDragAngle = 0;          // ultimo angolo letto (vinyl)
+  boolean draggingMiniWave = false;
+  float dragMiniStartPlayhead = 0;
+  float lastSentSeekSec = -999f;    // throttle invio /seek
 
   float vinylAngle = 0;
   boolean draggingVinyl = false;
@@ -60,7 +68,7 @@ class Deck {
 
     playPause = new ToggleButton("Play", false);
     playBtn = new PlayStopButton(); playBtn.setPlaying(false);
-    tempo = new Slider(true, factorToSlider(1.0)); tempo.setLabels("Tempo", "1.5x", "0.75x");
+    tempo = new Slider(true, 0.5); // 0.5 = centro = 0% variazione tempo.setLabels("", "", "");
     syncBtn = new Button("Sync"); loopInBtn = new Button("IN"); loopOutBtn = new Button("OUT"); cueBtn = new Button("CUE");
     loopInLeftBtn = new Button("<"); loopInRightBtn = new Button(">"); loopOutLeftBtn = new Button("<"); loopOutRightBtn = new Button(">");
 
@@ -242,7 +250,15 @@ void loadAudioFile(java.io.File f) {
 
     // Stems
     for (StemTrack s : stems) s.draw();
+    
+    drawTempoPercent();
+    
+
   }
+  
+    void drawTempoPercent() { float pct = getTempoPercent(); // -16.6 .. +16.6 
+    fill(230); textAlign(CENTER, TOP); textSize(12); text(formatSpeedPercent(pct), tempo.x + tempo.w/2f,
+    tempo.y - 14); textSize(14); }
 
   void drawCueButton() {
     boolean hover = cueBtn.contains(mouseX, mouseY);
@@ -258,11 +274,19 @@ void loadAudioFile(java.io.File f) {
     text("CUE", cueBtn.x + cueBtn.w/2, cueBtn.y + cueBtn.h/2);
   }
 
-  float sliderToFactor(float v) { return 0.75 + constrain(v, 0, 1) * 0.75; }
-  float factorToSlider(double f) { return (constrain((float)f, 0.75, 1.5) - 0.75f) / 0.75f; }
-  float getTempoFactor() { return sliderToFactor(tempo.getValue()); }
+float sliderToFactor(float s) {// s in [0,1] -> fattore in [1-SPEED_RANGE, 1+SPEED_RANGE] 
+float f = 1.0f + (s - 0.5f) * (SPEED_RANGE * 2.0f); 
+return constrain(f, 1.0f - SPEED_RANGE, 1.0f + SPEED_RANGE); }
+
+float factorToSlider(double fIn) { float f = (float)fIn; f = constrain(f, 1.0f - SPEED_RANGE, 1.0f + SPEED_RANGE); 
+return ((f - 1.0f) / (SPEED_RANGE * 2.0f)) + 0.5f; }
+
+float getTempoFactor() { return sliderToFactor(tempo.getValue()); }
   float getEffectiveBPM() { return ((analysis != null) ? analysis.bpm : bpmFallback) * getTempoFactor(); }
   float getLevelLinear() { return constrain(levelSmooth, 0, 1); }
+  
+  float getTempoPercent() { return (getTempoFactor() - 1.0f) * 100.0f; }
+  String formatSpeedPercent(float p) { String sgn = (p >= 0) ? "+" : ""; return sgn + nf(p, 0, 1) + "%"; }
 
   void updateTransport(float dt) {
     if (draggingVinyl) return;
@@ -305,6 +329,16 @@ void loadAudioFile(java.io.File f) {
   void seekToSeconds(float t) {
     float dur = (analysis != null) ? analysis.durationSec : trackLengthSec;
     playheadSec = constrain(t, 0, dur);
+  }
+  
+  void updatePlayheadFromMini(float mx) {
+    if (analysis == null) return;
+    float dur = analysis.durationSec;
+    float left = miniX + 6;
+    float right = miniX + miniW - 6;
+    float tNorm = (mx - left) / max(1, (right - left));
+    float t = constrain(tNorm, 0, 1) * dur;
+    seekToSeconds(t);
   }
 
   void syncToPeer() {
@@ -353,23 +387,41 @@ void loadAudioFile(java.io.File f) {
     directivity.mousePressed(mx, my);
     for (StemTrack s : stems) s.mousePressed(mx, my);
 
+    // CUE momentary (come prima)
     if (cueBtn.contains(mx, my)) {
       cueHolding = true;
       playWasPlayingBeforeCue = playBtn.getPlaying();
       playLatchedDuringCue = false;
+      if (!playWasPlayingBeforeCue && osc != null) {
+        osc.deckCueHold(this, true);
+        sentCueHoldToSC = true;
+      }
       if (!playWasPlayingBeforeCue) {
         playheadSec = cuePointSec;
         playBtn.setPlaying(true);
       }
     }
 
+    // Vinyl drag: avvio con angolo cumulativo
     if (pointInDisk(mx, my)) {
       draggingVinyl = true;
       float cx = diskX + diskSize/2f, cy = diskY + diskSize/2f;
       dragStartAngle = atan2(my - cy, mx - cx);
+      lastDragAngle = dragStartAngle;
+      dragAccumulatedAngle = 0;
       dragStartPlayhead = playheadSec;
       dragStartVinylAngle = vinylAngle;
       dragSecondsPerRotation = 240.0 / max(1e-4, getEffectiveBPM());
+    }
+
+    // Mini waveform drag (scrub lineare)
+    if (mx >= miniX && mx <= miniX + miniW && my >= miniY && my <= miniY + miniH) {
+      draggingMiniWave = true;
+      dragMiniStartPlayhead = playheadSec;
+      updatePlayheadFromMini(mx);
+      // invia subito /seek
+      if (osc != null) osc.deckSeek(this, playheadSec);
+      lastSentSeekSec = playheadSec;
     }
   }
 
@@ -378,74 +430,151 @@ void loadAudioFile(java.io.File f) {
     directivity.mouseDragged(mx, my);
     for (StemTrack s : stems) s.mouseDragged(mx, my);
 
+    // Vinyl drag continuo (multi rotazioni)
     if (draggingVinyl) {
       float cx = diskX + diskSize/2f, cy = diskY + diskSize/2f;
       float angNow = atan2(my - cy, mx - cx);
-      float dAng = shortestAngleDiff(angNow, dragStartAngle);
-      float newT = dragStartPlayhead + (dAng / TWO_PI) * dragSecondsPerRotation;
+      float delta = atan2(sin(angNow - lastDragAngle), cos(angNow - lastDragAngle)); // normalizzato -PI..PI
+      dragAccumulatedAngle += delta;
+      lastDragAngle = angNow;
+
+      float newT = dragStartPlayhead + (dragAccumulatedAngle / TWO_PI) * dragSecondsPerRotation;
+      // clamp (nessun wrap)
+      float dur = (analysis != null) ? analysis.durationSec : trackLengthSec;
+      newT = constrain(newT, 0, dur);
       seekToSeconds(newT);
-      vinylAngle = dragStartVinylAngle + dAng;
-      if (vinylAngle > PI) vinylAngle -= TWO_PI * floor((vinylAngle + PI) / TWO_PI);
-      if (vinylAngle < -PI) vinylAngle -= TWO_PI * floor((vinylAngle - PI) / TWO_PI);
+
+      // aggiorna disco grafico (angolo relativo, opzionale tenere accumulato)
+      vinylAngle = dragStartVinylAngle + dragAccumulatedAngle;
+      // normalizza solo per disegno (non influenza tempo)
+      vinylAngle = vinylAngle % TWO_PI;
+
+      // Throttle invio /seek ogni 50 ms di audio spostato
+      if (osc != null && abs(playheadSec - lastSentSeekSec) > 0.05f) {
+        osc.deckSeek(this, playheadSec);
+        lastSentSeekSec = playheadSec;
+      }
+    }
+
+    // Mini waveform drag
+    if (draggingMiniWave) {
+      updatePlayheadFromMini(mx);
+      if (osc != null && abs(playheadSec - lastSentSeekSec) > 0.05f) {
+        osc.deckSeek(this, playheadSec);
+        lastSentSeekSec = playheadSec;
+      }
     }
   }
 
-  void mouseReleased(float mx, float my) {
-    boolean playBtnWasPressed = playBtn.pressed;
+void mouseReleased(float mx, float my) {
+  boolean playBtnWasPressed = playBtn.pressed;
 
-    playBtn.mouseReleased(mx, my);
-    tempo.mouseReleased(mx, my);
-    directivity.mouseReleased(mx, my);
-    for (StemTrack s : stems) s.mouseReleased(mx, my);
+  playBtn.mouseReleased(mx, my);
+  tempo.mouseReleased(mx, my);
+  directivity.mouseReleased(mx, my);
+  for (StemTrack s : stems) s.mouseReleased(mx, my);
 
-    if (syncBtn.pressed && syncBtn.contains(mx, my)) syncToPeer();
-    syncBtn.mouseReleased(mx,my);
-
-    if (loopInBtn.pressed && loopInBtn.contains(mx, my)) {
-      loopInSec = playheadSec;
-      if (loopOutSec > loopInSec) loopEnabled = true;
-    }
-    loopInBtn.mouseReleased(mx,my);
-
-    if (loopOutBtn.pressed && loopOutBtn.contains(mx, my)) {
-      if (!loopEnabled) {
-        loopOutSec = playheadSec;
-        if (loopInSec >= 0 && loopOutSec > loopInSec + 0.02f) {
-          loopEnabled = true;
-          if (playheadSec >= loopOutSec) playheadSec = loopInSec;
-        }
-      } else {
-        loopEnabled = false; loopInSec = -1; loopOutSec = -1;
+  // Rilascio CUE (gestione hold)
+  if (cueBtn.pressed && cueBtn.contains(mx, my)) {
+    if (cueHolding) {
+      if (!playWasPlayingBeforeCue && !playLatchedDuringCue) {
+        playBtn.setPlaying(false);
+        playPause.state = false;
+        playheadSec = cuePointSec;
       }
-    }
-    loopOutBtn.mouseReleased(mx,my);
+      cueHolding = false;
 
-    if (loopInLeftBtn.pressed && loopInLeftBtn.contains(mx, my)) adjustLoopPoint('I', -1);
-    if (loopInRightBtn.pressed && loopInRightBtn.contains(mx, my)) adjustLoopPoint('I', +1);
-    if (loopOutLeftBtn.pressed && loopOutLeftBtn.contains(mx, my)) adjustLoopPoint('O', -1);
-    if (loopOutRightBtn.pressed && loopOutRightBtn.contains(mx, my)) adjustLoopPoint('O', +1);
-    loopInLeftBtn.mouseReleased(mx,my); loopInRightBtn.mouseReleased(mx,my);
-    loopOutLeftBtn.mouseReleased(mx,my); loopOutRightBtn.mouseReleased(mx,my);
-
-    if (cueHolding && playBtnWasPressed && !playWasPlayingBeforeCue && playBtn.contains(mx, my)) {
-      playLatchedDuringCue = true;
-    }
-
-    if (cueBtn.pressed && cueBtn.contains(mx,my)) {
-      if (cueHolding) {
-        if (!playWasPlayingBeforeCue && !playLatchedDuringCue) {
-          playBtn.setPlaying(false);
-          playPause.state = false;
-          playheadSec = cuePointSec;
-        }
-        cueHolding = false;
+      if (sentCueHoldToSC && osc != null) {
+        osc.deckCueHold(this, false);
       }
+      sentCueHoldToSC = false;
     }
-    cueBtn.mouseReleased(mx,my);
+  }
+  cueBtn.mouseReleased(mx,my);
 
-    playPause.state = playBtn.getPlaying();
+  // Loop IN
+  if (loopInBtn.pressed && loopInBtn.contains(mx, my)) {
+    loopInSec = playheadSec;
+    if (loopOutSec > loopInSec) loopEnabled = true;
+
+    if (osc != null) {
+      osc.deckSetLoopIn(this, loopInSec);
+      osc.deckSetLoopEnable(this, loopEnabled);
+    }
+  }
+  loopInBtn.mouseReleased(mx,my);
+
+  // Loop OUT / toggle enable
+  if (loopOutBtn.pressed && loopOutBtn.contains(mx, my)) {
+    if (!loopEnabled) {
+      loopOutSec = playheadSec;
+      if (loopInSec >= 0 && loopOutSec > loopInSec + 0.02f) {
+        loopEnabled = true;
+        if (playheadSec >= loopOutSec) playheadSec = loopInSec;
+      }
+    } else {
+      loopEnabled = false; loopInSec = -1; loopOutSec = -1;
+    }
+    if (osc != null) {
+      if (loopOutSec >= 0) osc.deckSetLoopOut(this, loopOutSec);
+      osc.deckSetLoopEnable(this, loopEnabled);
+    }
+  }
+  loopOutBtn.mouseReleased(mx,my);
+
+  if (loopInLeftBtn.pressed && loopInLeftBtn.contains(mx, my)) adjustLoopPoint('I', -1);
+  if (loopInRightBtn.pressed && loopInRightBtn.contains(mx, my)) adjustLoopPoint('I', +1);
+  if (loopOutLeftBtn.pressed && loopOutLeftBtn.contains(mx, my)) adjustLoopPoint('O', -1);
+  if (loopOutRightBtn.pressed && loopOutRightBtn.contains(mx, my)) adjustLoopPoint('O', +1);
+  loopInLeftBtn.mouseReleased(mx,my); loopInRightBtn.mouseReleased(mx,my);
+  loopOutLeftBtn.mouseReleased(mx,my); loopOutRightBtn.mouseReleased(mx,my);
+
+  // Se durante il cue-hold hai premuto Play, ricordalo
+  if (cueHolding && playBtnWasPressed && !playWasPlayingBeforeCue && playBtn.contains(mx, my)) {
+    playLatchedDuringCue = true;
+  }
+
+  // Fine drag vinile: invia seek finale a SC
+  if (draggingVinyl) {
+    if (osc != null) {
+      osc.deckSeek(this, playheadSec);
+      lastSentSeekSec = playheadSec;
+    }
+  }
+  draggingVinyl = false;
+
+    // Fine drag vinyl: invia seek finale
+    if (draggingVinyl) {
+      if (osc != null) osc.deckSeek(this, playheadSec);
+    }
     draggingVinyl = false;
-  }
+
+    // Fine drag mini waveform
+    if (draggingMiniWave) {
+      if (osc != null) osc.deckSeek(this, playheadSec);
+    }
+    draggingMiniWave = false;
+
+    // Play/Stop (mantieni comportamento originale)
+    if (playBtnWasPressed && playBtn.contains(mx, my)) {
+      if (osc != null) {
+        if (playBtn.getPlaying()) osc.deckPlay(this);
+        else {
+          // Salva cue prima di fermare (resume)
+          osc.deckSetCue(this, playheadSec);
+          osc.deckStop(this);
+        }
+      }
+    }
+
+    // Aggiorna speed (già presente)
+    if (osc != null) {
+      osc.deckSetSpeed(this, getTempoFactor());
+    }
+
+  // Allinea lo stato toggle locale
+  playPause.state = playBtn.getPlaying();
+}
 
   void adjustLoopPoint(char point, int direction) {
     if (analysis == null || analysis.beats == null || analysis.beats.isEmpty()) return;

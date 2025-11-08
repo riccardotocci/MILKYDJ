@@ -492,6 +492,10 @@ class FileBrowserPanel {
     try {
       deck.loadAudioFile(f);
       noteLoaded(f);
+      if (osc != null) {
+        osc.deckLoadFile(deck, f);   // carica in SC: CUE + stems + JSON
+        osc.deckSetCue(deck, 0.0f);  // imposta CUE a 0.0 secondi (solo “arm”)
+      }
     } catch (Exception ex) {
       println("Errore caricamento file: " + ex);
     }
@@ -509,8 +513,8 @@ void analyzeSelected() {
   String fileName = f.getName();
   
   String pythonPath = "/opt/anaconda3/envs/dj_ambisonics/bin/python";
-  String scriptPath = "/Users/riccardotocci/Desktop/cpac_work/dj_ambisonics/ambisonics_automation.py";
-  String workDir = "/Users/riccardotocci/Desktop/cpac_work/dj_ambisonics";
+  String scriptPath = "/Users/riccardotocci/Desktop/github/MILKYDJ/ambisonics_automation.py";
+  String workDir = "/Users/riccardotocci/Desktop/github/MILKYDJ";
   
   println("🎵 Processing: " + fileName);
   

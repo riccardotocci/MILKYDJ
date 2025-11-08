@@ -271,5 +271,13 @@ class MixerCenterPanel {
       cueBOn = !cueBOn;
     }
     btnCueB.mouseReleased(mx, my);
+    
+        // ——— AGGIUNTA OSC: crossfader al rilascio ———
+    // Invia crossfader e VOLUME dei deck come numeri
+    if (osc != null) {
+      osc.crossfader(cross.getValue());
+      osc.deckSetVolume(deckA, volA.getValue());
+      osc.deckSetVolume(deckB, volB.getValue());
+    }
   }
 }

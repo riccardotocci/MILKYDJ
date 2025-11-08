@@ -17,10 +17,12 @@ PFont uiFont;
 Deck deckA, deckB;
 MixerScreen mixer;
 AudioContext ac;
+OscBridge osc;
 
 Button btnMain, btnMixer;
 
 WaveformStrip wfA, wfB;
+
 
 MidiController midi;  // ← AGGIUNGI QUESTA
 
@@ -52,6 +54,9 @@ void setup() {
   uiFont = createFont("Inter", 14, true);
   textFont(uiFont);
  ac = new AudioContext();
+ 
+ 
+ 
 
 
 
@@ -80,10 +85,21 @@ void setup() {
   centerPanel = new MixerCenterPanel(deckA, deckB);
   fileBrowser = new FileBrowserPanel(deckA, deckB);
   
+  osc = new OscBridge(this);
+  // Dì a OscBridge quali sono i riferimenti dei deck/pannelli (serve anche per mappare A/B)
+  osc = new OscBridge(this);
+  osc.setTargets(deckA, deckB);
+  osc.setCenter(centerPanel);
+  osc.setBrowser(fileBrowser);
+  
+  wfA.setOsc(osc);
+wfB.setOsc(osc);
+  
   // Istanzia il controller MIDI
   midi = new MidiController( deckA, deckB, centerPanel, fileBrowser);
   ac.start();
   lastMillis = millis();
+
 }
 
 void draw() {
@@ -314,6 +330,11 @@ void mousePressed() {
   if (zoomSlider.contains(mouseX, mouseY)) { zoomSlider.mousePressed(mouseX, mouseY); return; }
 
   if (currentScreen == SCREEN_MAIN) {
+    wfA.mousePressed(mouseX, mouseY);
+    wfB.mousePressed(mouseX, mouseY);
+  }
+  
+  if (currentScreen == SCREEN_MAIN) {
     deckA.mousePressed(mouseX, mouseY);
     deckB.mousePressed(mouseX, mouseY);
     centerPanel.mousePressed(mouseX, mouseY);
@@ -325,7 +346,11 @@ void mousePressed() {
 
 void mouseDragged() {
   if (zoomSlider.dragging) { zoomSlider.mouseDragged(mouseX, mouseY); return; }
-
+  if (currentScreen == SCREEN_MAIN) {
+    wfA.mouseDragged(mouseX, mouseY);
+    wfB.mouseDragged(mouseX, mouseY);
+  }
+  
   if (currentScreen == SCREEN_MAIN) {
     deckA.mouseDragged(mouseX, mouseY);
     deckB.mouseDragged(mouseX, mouseY);
@@ -338,7 +363,10 @@ void mouseDragged() {
 
 void mouseReleased() {
   zoomSlider.mouseReleased(mouseX, mouseY);
-
+  if (currentScreen == SCREEN_MAIN) {
+    wfA.mouseReleased(mouseX, mouseY);
+    wfB.mouseReleased(mouseX, mouseY);
+  }
   if (currentScreen == SCREEN_MAIN) {
     deckA.mouseReleased(mouseX, mouseY);
     deckB.mouseReleased(mouseX, mouseY);

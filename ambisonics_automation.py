@@ -1,22 +1,54 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Ambisonics Automation - Tool unificato per DJ Ambisonics
+ambisonics_automation.py
 
-Parte 1: Separazione audio in 4 stems (vocals, drums, bass, other) con Demucs
-         Salva gli stems nella cartella stems/nome_brano/
+Workflow locale UNICO per MILKY_DJ:
+  Dato un file audio di input:
+    /Users/Riccardo/Scrivania/ciccio/song.mp3
+  crea stems e JSON dentro:
+    /Users/Riccardo/Scrivania/ciccio/stems/song/
+    ├── vocals.wav
+    ├── drums.wav
+    ├── bass.wav
+    ├── other.wav
+    ├── vocals_analysis.json
+    ├── drums_analysis.json
+    ├── bass_analysis.json
+    ├── other_analysis.json
 
-Parte 2: Analisi onset e caratteristiche audio
-         Crea file JSON con tutte le caratteristiche per ogni traccia
-         I file JSON possono essere caricati in SuperCollider
+Caratteristiche:
+- Separazione 4 stems con Demucs (modello htdemucs).
+- Analisi onset + features (BPM, onset_strength, contrast, spread) per ogni stem.
+- Cache dei risultati di analisi (.onset_cache/) per evitare ricalcoli.
+- Opzioni CLI semplici (separazione + analisi è il comportamento di default).
+- Nessun output disperse: tutto dentro la cartella stems/<basename>/.
+- Se la cartella esiste e contiene già le stems, per default NON rigenera (usa --force).
+- Analisi-only su intera cartella stems o su singolo file stem.
+- Tutti i JSON finiscono nella stessa cartella delle stems.
 
-Utilizzo:
-    # Separa stems
-    python ambisonics_automation.py separate input_audio.mp3
-    python ambisonics_automation.py separate input_audio.mp3 --output custom_folder
-    
-    # Analizza stems e crea JSON
-    python ambisonics_automation.py analyze --folder stems/song_name/
-    python ambisonics_automation.py analyze --file stems/song_name/drums.wav
+Uso rapido:
+    # Workflow completo (separa + analizza)
+    python ambisonics_automation.py /path/to/song.mp3
+
+    # Solo separazione
+    python ambisonics_automation.py /path/to/song.mp3 --no-analyze
+
+    # Solo analisi su cartella stems
+    python ambisonics_automation.py --analyze-only --folder /path/to/stems/song/
+
+    # Solo analisi su singolo stem
+    python ambisonics_automation.py --analyze-only --file /path/to/stems/song/drums.wav
+
+    # Forza nuova separazione (ignora stems esistenti)
+    python ambisonics_automation.py /path/to/song.mp3 --force
+
+    # Pulisci cache
+    python ambisonics_automation.py --clear-cache
+
+Note:
+- Richiede Demucs installato nell'env (es. /opt/anaconda3/envs/dj_ambisonics/bin/demucs).
+- Richiede: librosa, numpy, scipy (per analisi).
 """
 
 import os
@@ -27,623 +59,367 @@ import shutil
 import platform
 import logging
 import time
+import hashlib
+import json
+import warnings
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
-# ============================================================================
-# Setup logging
-# ============================================================================
+warnings.filterwarnings('ignore')
 
+# ---------------------------------------
+# LOGGING
+# ---------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("ambisonics")
 
+# ---------------------------------------
+# COSTANTI GENERALI
+# ---------------------------------------
+VALID_EXTENSIONS = {".wav", ".wave", ".aif", ".aiff", ".mp3", ".flac", ".ogg", ".m4a"}
+STEM_NAMES = ["vocals", "drums", "bass", "other"]
 
-# ============================================================================
-# Utilità
-# ============================================================================
+CACHE_DIR = ".onset_cache"
+MAX_WORKERS = 4
+HOP_LENGTH = 512
 
-def get_demucs_command():
-    """Trova il comando demucs (gestisce sia PATH che path assoluto)"""
-    # Prova a trovare demucs nel PATH
-    demucs_cmd = shutil.which('demucs')
-    
-    if demucs_cmd:
-        return demucs_cmd
-    
-    # Se non trovato, prova path comuni conda
-    possible_paths = [
-        os.path.join(os.path.dirname(sys.executable), 'demucs'),  # Stesso dir di python
-        os.path.expanduser('~/anaconda3/envs/dj_ambisonics/bin/demucs'),
-        os.path.expanduser('~/miniconda3/envs/dj_ambisonics/bin/demucs'),
-        '/opt/anaconda3/envs/dj_ambisonics/bin/demucs',
-        '/opt/miniconda3/envs/dj_ambisonics/bin/demucs',
+# ---------------------------------------
+# FUNZIONI UTILI PATH
+# ---------------------------------------
+def safe_path(p: Path) -> Path:
+    return p.expanduser().resolve()
+
+def stems_dir_for_input(input_file: str) -> Path:
+    p = safe_path(Path(input_file))
+    return p.parent / "stems" / p.stem
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------
+# DEMUCS RILEVAMENTO
+# ---------------------------------------
+def find_demucs():
+    # 1) PATH
+    cmd = shutil.which("demucs")
+    if cmd:
+        return cmd
+    # 2) location comuni
+    candidates = [
+        os.path.join(os.path.dirname(sys.executable), "demucs"),
+        "/opt/anaconda3/envs/dj_ambisonics/bin/demucs",
+        "/opt/miniconda3/envs/dj_ambisonics/bin/demucs",
+        os.path.expanduser("~/anaconda3/envs/dj_ambisonics/bin/demucs"),
+        os.path.expanduser("~/miniconda3/envs/dj_ambisonics/bin/demucs"),
     ]
-    
-    for path in possible_paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            logger.info(f"📍 Demucs trovato in: {path}")
-            return path
-    
-    # Fallback: usa 'demucs' e speriamo sia nel PATH
-    logger.warning("⚠️  Demucs non trovato in path comuni, uso 'demucs' generico")
-    return 'demucs'
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            log.info(f"Demucs trovato: {c}")
+            return c
+    log.warning("Demucs non trovato esplicitamente — uso 'demucs' (PATH)")
+    return "demucs"
 
-
-def get_optimal_device():
-    """Rileva automaticamente il device ottimale per Demucs"""
-    system = platform.system()
-    processor = platform.processor()
-    
-    if system == "Darwin" and processor == "arm":
-        # Ottimizzazioni avanzate per Apple Silicon Neural Engine
+def auto_device():
+    sysname = platform.system()
+    proc = platform.processor()
+    if sysname == "Darwin" and "arm" in proc.lower():
         try:
             import torch
             if torch.backends.mps.is_available():
-                # Abilita ottimizzazioni MPS per Neural Engine
                 torch.set_float32_matmul_precision('high')
-                logger.info("🧠 Ottimizzazioni avanzate Neural Engine attivate")
-        except (ImportError, AttributeError):
+                log.info("Ottimizzazioni MPS attivate")
+                return "mps"
+        except Exception:
             pass
-        return "mps"  # Apple Silicon Neural Engine
-    elif system == "Darwin":
-        return "cpu"  # Intel Mac
+        return "mps"
+    elif sysname == "Darwin":
+        return "cpu"
     else:
-        # Linux/Windows - controlla CUDA
         try:
             import torch
             if torch.cuda.is_available():
                 return "cuda"
-        except ImportError:
+        except Exception:
             pass
         return "cpu"
 
-
-def get_song_name(input_file):
-    """Estrae il nome del brano dal file"""
-    return Path(input_file).stem
-
-
-# ============================================================================
-# Separazione con Demucs
-# ============================================================================
-
-def separate_4stems(input_file, output_dir=None, device=None):
+# ---------------------------------------
+# SEPARAZIONE STEMS
+# ---------------------------------------
+def separate_4stems(input_file: str, force=False, device=None) -> dict:
     """
-    Separa l'audio in 4 stems usando Demucs e salva i file nella cartella output.
-    
-    Args:
-        input_file: Path al file audio di input
-        output_dir: Directory di output (default: nome_brano/)
-        device: Device da usare (mps/cuda/cpu, default: auto-detect)
-    
-    Returns:
-        dict: Dictionary con i path delle 4 stems salvate
+    Separa in 4 stems se non già presenti (o se force=True).
+    Ritorna dict stem->path.
     """
-    logger.info("🎵 Avvio separazione 4 stems con Demucs")
-    logger.info(f"📁 File input: {input_file}")
-    
-    start_time = time.time()
-    
-    # Verifica che il file esista
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"File non trovato: {input_file}")
-    
-    # Determina device
-    device = device or get_optimal_device()
-    logger.info(f"🧠 Device selezionato: {device}")
-    
-    # Determina output directory
-    song_name = get_song_name(input_file)
-    if output_dir is None:
-        output_dir = song_name
-    
-    os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"📂 Output directory: {output_dir}/")
-    
-    # Crea directory temporanea per Demucs
-    temp_dir = os.path.join(output_dir, "temp_demucs")
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    try:
-        # ====================================================================
-        # Esegui Demucs
-        # ====================================================================
-        logger.info("\n" + "="*70)
-        logger.info("🔄 Esecuzione Demucs per separazione stems...")
-        logger.info("="*70)
-        
-        # Trova comando demucs
-        demucs_cmd = get_demucs_command()
-        
-        # Costruisci comando Demucs
-        cmd = [
-            demucs_cmd,
-            "-o", temp_dir,        # Output directory
-            "-n", "htdemucs",      # Modello da usare (compatibile con MPS)
-            "--device", device,    # Device (mps/cuda/cpu)
-        ]
-        
-        # Ottimizzazioni per device
-        if device == "mps":
-            # Apple Silicon: ottimizzazioni specifiche per M3/M4 Max Neural Engine
-            import multiprocessing as mp
-            cpu_count = mp.cpu_count()
-            
-            if cpu_count >= 12:  # M3 Pro/Max, M4 Pro/Max
-                cmd.extend(["--segment", "7"])      # Massimo sicuro sotto limite
-                cmd.extend(["--overlap", "0.05"])   # Overlap minimo per velocità
-                cmd.extend(["--shifts", "1"])       # Un solo shift
-                cmd.extend(["--jobs", "1"])         # Singolo job per Neural Engine
-                logger.info(f"🚀 Ottimizzazioni M3/M4 Max Neural Engine attive ({cpu_count} cores)")
-            else:  # M1/M2 base
-                cmd.extend(["--segment", "7"])
-                cmd.extend(["--overlap", "0.1"])
-                cmd.extend(["--shifts", "1"])
-                logger.info(f"🍎 Ottimizzazioni Apple Neural Engine standard ({cpu_count} cores)")
-        elif device == "cuda":
-            # NVIDIA GPU
-            cmd.extend(["--segment", "7"])
-            cmd.extend(["--overlap", "0.1"])
-            cmd.extend(["--shifts", "1"])
-            logger.info("🚀 Ottimizzazioni CUDA GPU attive")
+    t0 = time.time()
+    src = safe_path(Path(input_file))
+    if not src.exists():
+        raise FileNotFoundError(f"File non trovato: {src}")
+
+    out_dir = stems_dir_for_input(str(src))
+    ensure_dir(out_dir)
+
+    # Se tutte le stems esistono e non forzi, salta
+    existing = all((out_dir / f"{stem}.wav").exists() for stem in STEM_NAMES)
+    if existing and not force:
+        log.info("Stems già presenti — salto separazione (usa --force per rigenerare).")
+        return {s: str(out_dir / f"{s}.wav") for s in STEM_NAMES}
+
+    # Temp dir
+    temp_dir = out_dir / "temp_demucs"
+    ensure_dir(temp_dir)
+
+    demucs_cmd = find_demucs()
+    device = device or auto_device()
+
+    cmd = [
+        demucs_cmd,
+        "-o", str(temp_dir),
+        "-n", "htdemucs",
+        "--device", device
+    ]
+
+    # Ottimizzazioni base (segment/overlap/varianti)
+    if device == "mps":
+        cmd += ["--segment", "7", "--overlap", "0.05", "--shifts", "1", "--jobs", "1"]
+    elif device == "cuda":
+        cmd += ["--segment", "7", "--overlap", "0.1", "--shifts", "1"]
+    else:
+        cmd += ["--segment", "6", "--overlap", "0.15", "--shifts", "1"]
+
+    cmd.append(str(src))
+
+    log.info("Eseguo Demucs:")
+    log.info(" ".join(f'"{c}"' if " " in c else c for c in cmd))
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error(result.stderr.strip())
+        raise RuntimeError("Demucs fallito")
+
+    demucs_out = temp_dir / "htdemucs" / src.stem
+    paths = {}
+    for stem in STEM_NAMES:
+        sfile = demucs_out / f"{stem}.wav"
+        if sfile.exists():
+            dst = out_dir / f"{stem}.wav"
+            shutil.copy2(sfile, dst)
+            paths[stem] = str(dst)
+            size_mb = dst.stat().st_size / (1024 * 1024)
+            log.info(f"✓ {stem}.wav ({size_mb:.1f} MB)")
         else:
-            # CPU
-            cmd.extend(["--segment", "6"])
-            cmd.extend(["--overlap", "0.15"])
-            cmd.extend(["--shifts", "1"])
-            logger.info("⚡ Ottimizzazioni CPU attive")
-        
-        cmd.append(input_file)
-        
-        logger.info(f"💻 Comando: {' '.join(cmd)}")
-        logger.info("⏳ Elaborazione in corso (potrebbe richiedere alcuni minuti)...\n")
-        
-        # Esegui Demucs
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            logger.error(f"❌ Demucs fallito!")
-            logger.error(f"Stderr: {result.stderr}")
-            raise RuntimeError(f"Demucs error: {result.stderr}")
-        
-        demucs_time = time.time() - start_time
-        logger.info(f"✅ Demucs completato in {demucs_time:.1f}s")
-        
-        # ====================================================================
-        # Copia stems nella directory finale
-        # ====================================================================
-        logger.info("\n" + "="*70)
-        logger.info("📦 Organizzazione stems nella directory output...")
-        logger.info("="*70)
-        
-        # Path dove Demucs salva i file
-        demucs_output = os.path.join(temp_dir, "htdemucs", song_name)
-        
-        stems = ['vocals', 'drums', 'bass', 'other']
-        stem_paths = {}
-        
-        for stem in stems:
-            src_path = os.path.join(demucs_output, f"{stem}.wav")
-            dst_path = os.path.join(output_dir, f"{stem}.wav")
-            
-            if os.path.exists(src_path):
-                shutil.copy2(src_path, dst_path)
-                stem_paths[stem] = dst_path
-                
-                # Calcola dimensione file
-                size_mb = os.path.getsize(dst_path) / (1024 * 1024)
-                logger.info(f"   ✓ {stem}.wav salvato ({size_mb:.1f} MB)")
-            else:
-                logger.warning(f"   ⚠️ {stem}.wav non trovato")
-        
-        # ====================================================================
-        # Pulizia directory temporanea
-        # ====================================================================
-        logger.info("\n🧹 Pulizia directory temporanea...")
-        shutil.rmtree(temp_dir)
-        logger.info("   ✓ Directory temporanea rimossa")
-        
-        # ====================================================================
-        # Report finale
-        # ====================================================================
-        total_time = time.time() - start_time
-        
-        logger.info("\n" + "="*70)
-        logger.info("✅ SEPARAZIONE COMPLETATA!")
-        logger.info("="*70)
-        logger.info(f"⏱️  Tempo totale: {total_time:.1f}s")
-        logger.info(f"📁 Directory output: {output_dir}/")
-        logger.info(f"🎵 Stems generate: {len(stem_paths)}/4")
-        logger.info("\nFile salvati:")
-        for stem, path in stem_paths.items():
-            logger.info(f"   • {stem}.wav")
-        logger.info("="*70)
-        
-        return stem_paths
-        
-    except Exception as e:
-        logger.error(f"❌ Errore durante la separazione: {e}")
-        
-        # Pulizia in caso di errore
-        if os.path.exists(temp_dir):
-            logger.info("🧹 Pulizia directory temporanea dopo errore...")
-            shutil.rmtree(temp_dir)
-        
-        raise
+            log.warning(f"Stem mancante: {stem}.wav")
 
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    log.info(f"Separazione completata in {time.time()-t0:.1f}s")
+    return paths
 
-# ============================================================================
-# PARTE 2: Analisi onset e salvataggio JSON
-# ============================================================================
+# ---------------------------------------
+# CACHE ANALISI
+# ---------------------------------------
+def file_hash(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
-"""
-Analizzatore onset ottimizzato per DJ Ambisonics
-Salva i risultati in file JSON per ogni traccia invece di inviare messaggi OSC.
-Ottimizzazioni:
-- Cache per file già analizzati
-- Elaborazione parallela
-- Operazioni vettoriali numpy ottimizzate
-- Riduzione allocazioni memoria
-- Batch processing migliorato
-"""
+def cache_path(path: str) -> Path:
+    ensure_dir(Path(CACHE_DIR))
+    fn = Path(path).name
+    safe = "".join(c if c.isalnum() else "_" for c in fn)
+    return Path(CACHE_DIR) / f"{safe}_{file_hash(path)}.json"
 
-import librosa
-import os
-import numpy as np
-from scipy.signal import butter, sosfilt
-import time
-import hashlib
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-import warnings
-
-warnings.filterwarnings('ignore')
-
-# Configurazione analisi audio
-VALID_EXTENSIONS = {".wav", ".wave", ".aif", ".aiff", ".mp3", ".flac", ".ogg", ".m4a"}
-HOP_LENGTH = 512
-
-# Cache per analisi (evita ricalcoli)
-CACHE_DIR = ".onset_cache"
-MAX_WORKERS = 4  # Parallelismo per analisi multi-file
-
-# Directory output per file JSON
-OUTPUT_JSON_DIR = "output"
-
-# Pre-calcolo filtri (evita ricalcoli)
-@lru_cache(maxsize=8)
-def get_band_filter(sr):
-    """Cache per filtro passa-banda."""
-    nyquist = sr / 2
-    low_cutoff = min(50.0 / nyquist, 0.99)
-    high_cutoff = min(8000.0 / nyquist, 0.99)
-    return butter(4, [low_cutoff, high_cutoff], btype='band', output='sos')
-
-@lru_cache(maxsize=8)
-def get_lowpass_filter(sr):
-    """Cache per filtro passa-basso."""
-    nyquist = sr / 2
-    cutoff = 15.0 / nyquist
-    return butter(4, cutoff, btype='low', output='sos')
-
-def get_file_hash(file_path):
-    """Calcola hash MD5 del file per cache."""
-    hasher = hashlib.md5()
-    with open(file_path, 'rb') as f:
-        # Leggi solo i primi 8KB per velocità
-        hasher.update(f.read(8192))
-    return hasher.hexdigest()
-
-def get_cache_path(file_path):
-    """Genera path per file cache."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    file_hash = get_file_hash(file_path)
-    filename = os.path.basename(file_path)
-    safe_name = "".join(c if c.isalnum() else "_" for c in filename)
-    return os.path.join(CACHE_DIR, f"{safe_name}_{file_hash}.json")
-
-def load_from_cache(file_path):
-    """Carica risultati dalla cache se disponibili."""
-    cache_path = get_cache_path(file_path)
-    if os.path.exists(cache_path):
+def load_cache(path: str):
+    cp = cache_path(path)
+    if cp.exists():
         try:
-            with open(cache_path, 'r') as f:
-                return json.load(f)
-        except:
+            return json.loads(cp.read_text())
+        except Exception:
             return None
     return None
 
-def save_to_cache(file_path, data):
-    """Salva risultati in cache."""
-    cache_path = get_cache_path(file_path)
+def save_cache(path: str, data: dict):
+    cp = cache_path(path)
     try:
-        with open(cache_path, 'w') as f:
-            json.dump(data, f)
+        cp.write_text(json.dumps(data))
     except Exception as e:
-        print(f"⚠️ Errore salvataggio cache: {e}")
+        log.warning(f"Cache write error: {e}")
 
-def calculate_bpm(file_path):
-    """Calcola il BPM di un file audio (ottimizzato)."""
+# ---------------------------------------
+# ANALISI AUDIO
+# ---------------------------------------
+import numpy as np
+import librosa
+from scipy.signal import butter, sosfilt
+
+@lru_cache(maxsize=8)
+def band_filter(sr):
+    ny = sr / 2
+    low = min(50.0 / ny, 0.99)
+    high = min(8000.0 / ny, 0.99)
+    return butter(4, [low, high], btype="band", output="sos")
+
+@lru_cache(maxsize=8)
+def lowpass_filter(sr):
+    ny = sr / 2
+    cutoff = min(15.0 / ny, 0.99)
+    return butter(4, cutoff, btype="low", output="sos")
+
+def calc_bpm(path: str):
     try:
-        # Carica l'intero file audio al sample rate originale
-        y, sr = librosa.load(file_path, sr=None, mono=True)
-        
-        if len(y) == 0:
-            return 0.0, "File audio vuoto", None, None, None
-        
-        # Normalizza
+        y, sr = librosa.load(path, sr=None, mono=True)
+        if y.size == 0:
+            return 0.0, None, None, None
         if np.abs(y).max() > 0:
             y = librosa.util.normalize(y)
-        
-        # Calcola BPM usando librosa
         tempo, beat_frames = librosa.beat.beat_track(
-            y=y, 
-            sr=sr, 
-            hop_length=HOP_LENGTH,
-            trim=False
+            y=y, sr=sr, hop_length=HOP_LENGTH, trim=False
         )
-        
-        bpm = float(tempo) if np.isfinite(tempo) and tempo > 0 else 0.0
-        
-        if bpm > 0:
-            return bpm, f"BPM: {bpm:.1f}, beats: {len(beat_frames)}", y, sr, beat_frames
-        else:
-            return 0.0, "BPM non rilevabile", y, sr, None
-            
-    except Exception as e:
-        return 0.0, f"Errore: {str(e)}", None, None, None
+        bpm = float(tempo) if tempo and tempo > 0 else 0.0
+        return bpm, y, sr, beat_frames
+    except Exception:
+        return 0.0, None, None, None
 
-def calculate_envelope_features_vectorized(y, sr, onset_frames):
-    """
-    Versione vettorizzata ottimizzata del calcolo envelope features.
-    Riduce loop e usa operazioni numpy batch.
-    """
-    if len(onset_frames) == 0:
+def envelope_features(y, sr, onset_samples):
+    if onset_samples.size == 0:
         return []
-    
-    # Filtri cached
-    sos_band = get_band_filter(sr)
-    sos_low = get_lowpass_filter(sr)
-    
-    # Applica filtri
-    y_filtered = sosfilt(sos_band, y)
-    y_rect = np.abs(y_filtered)
-    envelope = sosfilt(sos_low, y_rect)
-    
-    # Normalizza
-    env_max = envelope.max()
-    if env_max > 0:
-        envelope /= env_max
-    
-    # STFT per analisi spettrale
+
+    sos_b = band_filter(sr)
+    sos_l = lowpass_filter(sr)
+    y_f = sosfilt(sos_b, y)
+    env = sosfilt(sos_l, np.abs(y_f))
+    vmax = env.max()
+    if vmax > 0:
+        env /= vmax
+
     n_fft = 2048
-    hop_length = 512
-    S = np.abs(librosa.stft(y_filtered, n_fft=n_fft, hop_length=hop_length))
+    hop = 512
+    S = np.abs(librosa.stft(y_f, n_fft=n_fft, hop_length=hop))
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-    
-    max_analysis_samples = int(0.5 * sr)
-    features = []
-    
-    # Pre-calcola finestre per tutti gli onset
-    onset_windows = []
-    for i, onset_sample in enumerate(onset_frames):
-        if i < len(onset_frames) - 1:
-            window_end = min(onset_sample + max_analysis_samples, onset_frames[i + 1])
+    max_win = int(0.5 * sr)
+
+    feats = []
+    for i, onset in enumerate(onset_samples):
+        # finestra fino a prossimo onset o max_win
+        if i < len(onset_samples) - 1:
+            end = min(onset + max_win, onset_samples[i+1])
         else:
-            window_end = min(onset_sample + max_analysis_samples, len(envelope))
-        onset_windows.append((onset_sample, window_end))
-    
-    # Batch processing per finestre
-    for i, (onset_sample, window_end) in enumerate(onset_windows):
-        if window_end <= onset_sample:
-            features.append({
-                'attack_time': 0.0,
-                'release_time': 0.0,
-                'velocity_value': 0.0,
-                'spectral_mean_freq': 0.0
-            })
+            end = min(onset + max_win, len(env))
+        if end <= onset:
+            feats.append(dict(attack_time=0.0,
+                              release_time=0.0,
+                              velocity_value=0.0,
+                              spectral_mean_freq=0.0))
             continue
-        
-        env_window = envelope[onset_sample:window_end]
-        
-        # Analisi spettrale
-        onset_frame = onset_sample // hop_length
-        window_end_frame = window_end // hop_length
-        onset_frame = min(onset_frame, S.shape[1] - 1)
-        window_end_frame = min(max(window_end_frame, onset_frame + 1), S.shape[1])
-        
-        spectrum_window = S[:, onset_frame:window_end_frame]
-        
-        # Calcolo centroid vettorizzato
-        if spectrum_window.shape[1] > 0:
-            spectrum_sum = spectrum_window.sum(axis=0)
-            mask = spectrum_sum > 0
+
+        w = env[onset:end]
+        peak = w.argmax()
+        attack = peak / sr
+        peak_val = w[peak]
+        thr = peak_val * 0.5
+        decay = w[peak:]
+        below = np.where(decay < thr)[0]
+        release = (below[0]/sr) if below.size else (decay.size/sr)
+
+        onset_f = onset // hop
+        end_f = end // hop
+        onset_f = min(onset_f, S.shape[1]-1)
+        end_f = min(max(end_f, onset_f+1), S.shape[1])
+        spec_slice = S[:, onset_f:end_f]
+        if spec_slice.size == 0:
+            centroid = 0.0
+        else:
+            slic_sum = spec_slice.sum(axis=0)
+            mask = slic_sum > 0
             if mask.any():
-                weighted_freqs = (freqs[:, np.newaxis] * spectrum_window[:, mask]).sum(axis=0)
-                spectral_centroids = weighted_freqs / spectrum_sum[mask]
-                spectral_mean_freq = spectral_centroids.mean()
+                weighted = (freqs[:, None] * spec_slice[:, mask]).sum(axis=0)
+                centroid = (weighted / slic_sum[mask]).mean()
             else:
-                spectral_mean_freq = 0.0
-        else:
-            spectral_mean_freq = 0.0
-        
-        if len(env_window) < 2:
-            features.append({
-                'attack_time': 0.0,
-                'release_time': 0.0,
-                'velocity_value': 0.0,
-                'spectral_mean_freq': spectral_mean_freq
-            })
-            continue
-        
-        # Attack e release vettorizzati
-        peak_idx = env_window.argmax()
-        attack_time = peak_idx / sr
-        
-        peak_value = env_window[peak_idx]
-        threshold = peak_value * 0.5
-        
-        # Trova release usando operazioni vettoriali
-        decay_region = env_window[peak_idx:]
-        below_threshold = np.where(decay_region < threshold)[0]
-        
-        if len(below_threshold) > 0:
-            release_samples = below_threshold[0]
-        else:
-            release_samples = len(decay_region)
-        
-        release_time = release_samples / sr
-        
-        # Calcolo velocity normalizzato
-        attack_norm = np.clip(attack_time / 0.1, 0.0, 1.0)
-        release_norm = np.clip(release_time / 0.5, 0.0, 1.0)
-        velocity_value = 1.0 - (0.3 * attack_norm + 0.7 * release_norm)
-        
-        features.append({
-            'attack_time': attack_time,
-            'release_time': release_time,
-            'velocity_value': velocity_value,
-            'spectral_mean_freq': spectral_mean_freq
-        })
-    
-    return features
+                centroid = 0.0
 
-def group_by_beat_position_vectorized(onset_times, beat_frames, sr, features):
-    """Versione vettorizzata del raggruppamento per beat."""
-    if len(onset_times) == 0:
-        return []
-    
-    onset_times_arr = np.array(onset_times)
-    velocity_arr = np.array([f['velocity_value'] for f in features])
-    spectral_arr = np.array([f['spectral_mean_freq'] for f in features])
-    
-    # Media mobile corretta: solo guardando indietro (come originale)
-    window_size = 20
-    spectral_smoothed = np.zeros(len(spectral_arr))
-    for i in range(len(spectral_arr)):
-        start_idx = max(0, i - window_size + 1)
-        spectral_smoothed[i] = spectral_arr[start_idx:i+1].mean()
-    
-    # Gestione casi senza beat
-    if beat_frames is None or len(beat_frames) == 0:
-        grouped_data = []
-        for i in range(len(onset_times)):
-            grouped_data.append({
-                'onset_time': float(onset_times_arr[i]),
-                'beat_index': 0,
-                'beat_position': float(onset_times_arr[i]),
-                'beat_fraction': 0.0,
-                'attack_time': features[i]['attack_time'],
-                'release_time': features[i]['release_time'],
-                'velocity_value': float(velocity_arr[i]),
-                'velocity_value_grouped': float(velocity_arr[i]),
-                'spectral_mean_freq': float(spectral_arr[i]),
-                'spectral_mean_freq_smoothed': float(spectral_smoothed[i])
-            })
-        return grouped_data
-    
-    # Calcolo beat positions vettorizzato
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=HOP_LENGTH)
-    beat_start = beat_times[0] if len(beat_times) > 0 else 0.0
-    beat_period = 60.0 / len(beat_times) * (beat_times[-1] - beat_start) if len(beat_times) > 1 else 1.0
-    
-    beat_positions = (onset_times_arr - beat_start) / beat_period if beat_period > 0 else np.zeros_like(onset_times_arr)
-    beat_indices = np.round(beat_positions).astype(int)
-    beat_fractions = beat_positions - beat_indices
-    
-    # Raggruppa per beat e calcola medie
-    grouped_data = []
-    beat_groups = {}
-    
-    for i in range(len(onset_times)):
-        beat_idx = int(beat_indices[i])
-        if beat_idx not in beat_groups:
-            beat_groups[beat_idx] = []
-        beat_groups[beat_idx].append(i)
-    
-    # Calcola velocity grouped
-    velocity_grouped = velocity_arr.copy()
-    for beat_idx, indices in beat_groups.items():
-        avg_vel = velocity_arr[indices].mean()
-        for i in indices:
-            velocity_grouped[i] = avg_vel
-    
-    for i in range(len(onset_times)):
-        grouped_data.append({
-            'onset_time': float(onset_times_arr[i]),
-            'beat_index': int(beat_indices[i]),
-            'beat_position': float(beat_positions[i]),
-            'beat_fraction': float(beat_fractions[i]),
-            'attack_time': features[i]['attack_time'],
-            'release_time': features[i]['release_time'],
-            'velocity_value': float(velocity_arr[i]),
-            'velocity_value_grouped': float(velocity_grouped[i]),
-            'spectral_mean_freq': float(spectral_arr[i]),
-            'spectral_mean_freq_smoothed': float(spectral_smoothed[i])
-        })
-    
-    # Riordina per tempo (importante dopo il raggruppamento)
-    grouped_data.sort(key=lambda x: x['onset_time'])
-    
-    return grouped_data
+        a_norm = np.clip(attack / 0.1, 0, 1)
+        r_norm = np.clip(release / 0.5, 0, 1)
+        velocity = 1.0 - (0.3 * a_norm + 0.7 * r_norm)
 
-def analyze_single_file_cached(file_path):
-    """Analizza file con cache."""
-    filename = os.path.basename(file_path)
-    
-    # Validazione
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext not in VALID_EXTENSIONS or not os.path.isfile(file_path):
+        feats.append(dict(
+            attack_time=attack,
+            release_time=release,
+            velocity_value=velocity,
+            spectral_mean_freq=centroid
+        ))
+    return feats
+
+def analyze_file(path: str):
+    """
+    Analizza un singolo file (usa cache se disponibile).
+    Ritorna: (is_valid, bpm, grouped_data(list))
+    grouped_data elementi con onset_time, velocity_value ecc.
+    """
+    ext = Path(path).suffix.lower()
+    if ext not in VALID_EXTENSIONS or not Path(path).is_file():
         return False, 0.0, []
-    
-    # Controlla cache
-    cached = load_from_cache(file_path)
-    if cached is not None:
-        print(f"💾 Cache hit: {filename}")
-        return cached['is_valid'], cached['bpm'], cached['grouped_data']
-    
-    # Analisi completa
-    bpm, bpm_msg, y, sr, beat_frames = calculate_bpm(file_path)
-    
-    if y is None or sr is None:
-        result = {'is_valid': False, 'bpm': bpm, 'grouped_data': []}
-        save_to_cache(file_path, result)
-        return False, bpm, []
-    
-    # Detect onset
-    onset_frames = librosa.onset.onset_detect(
-        y=y,
-        sr=sr,
-        hop_length=HOP_LENGTH,
-        units='samples',
-        backtrack=True
-    )
-    
-    if len(onset_frames) == 0:
-        result = {'is_valid': True, 'bpm': bpm, 'grouped_data': []}
-        save_to_cache(file_path, result)
-        return True, bpm, []
-    
-    onset_times = onset_frames / sr
-    
-    # Features vettorizzate
-    features = calculate_envelope_features_vectorized(y, sr, onset_frames)
-    
-    # Raggruppamento vettorizzato
-    grouped_data = group_by_beat_position_vectorized(onset_times, beat_frames, sr, features)
-    
-    # Salva in cache
-    result = {'is_valid': True, 'bpm': bpm, 'grouped_data': grouped_data}
-    save_to_cache(file_path, result)
-    
-    return True, bpm, grouped_data
 
-def prepare_analysis_data(filename, grouped_data):
-    """Prepara i dati di analisi per essere salvati in JSON."""
-    if not grouped_data:
+    cached = load_cache(path)
+    if cached:
+        return cached['is_valid'], cached['bpm'], cached['grouped_data']
+
+    bpm, y, sr, beat_frames = calc_bpm(path)
+    if y is None:
+        data = dict(is_valid=False, bpm=bpm, grouped_data=[])
+        save_cache(path, data)
+        return False, bpm, []
+
+    onset_samples = librosa.onset.onset_detect(
+        y=y, sr=sr, hop_length=HOP_LENGTH, units="samples", backtrack=True
+    )
+    onset_times = onset_samples / sr
+    feats = envelope_features(y, sr, onset_samples)
+
+    # Beat mapping semplificato
+    if beat_frames is not None and beat_frames.size > 0:
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=HOP_LENGTH)
+        period = np.median(np.diff(beat_times)) if beat_times.size > 1 else 1.0
+        start = beat_times[0]
+        positions = (onset_times - start) / period
+        beat_indices = np.round(positions).astype(int)
+        beat_fracs = positions - beat_indices
+    else:
+        positions = onset_times.copy()
+        beat_indices = np.zeros_like(positions, dtype=int)
+        beat_fracs = np.zeros_like(positions)
+
+    grouped = []
+    for i, t in enumerate(onset_times):
+        f = feats[i]
+        grouped.append(dict(
+            onset_time=float(t),
+            beat_index=int(beat_indices[i]),
+            beat_position=float(positions[i]),
+            beat_fraction=float(beat_fracs[i]),
+            attack_time=float(f['attack_time']),
+            release_time=float(f['release_time']),
+            velocity_value=float(f['velocity_value']),
+            spectral_mean_freq=float(f['spectral_mean_freq'])
+        ))
+
+    data = dict(is_valid=True, bpm=bpm, grouped_data=grouped)
+    save_cache(path, data)
+    return True, bpm, grouped
+
+def prepare_json_analysis(filename: str, bpm: float, grouped: list):
+    """
+    Converte la lista grouped in struttura sintetica per JSON:
+      onset_times, beat_positions, onset_strength (velocity^gamma), contrast, spread
+    """
+    if not grouped:
         return {
             'filename': filename,
             'num_onsets': 0,
@@ -653,329 +429,223 @@ def prepare_analysis_data(filename, grouped_data):
             'onset_contrast': [],
             'onset_spread': []
         }
-    
-    n = len(grouped_data)
-    
-    # Pre-alloca array numpy
-    onset_times = np.array([d['onset_time'] for d in grouped_data], dtype=np.float32)
-    beat_positions = np.array([d['beat_position'] for d in grouped_data], dtype=np.float32)
-    velocity_values = np.array([d['velocity_value_grouped'] for d in grouped_data], dtype=np.float32)
-    spectral_freqs = np.array([d['spectral_mean_freq_smoothed'] for d in grouped_data], dtype=np.float32)
-    release_times = np.array([d['release_time'] for d in grouped_data], dtype=np.float32)
-    
-    # Media mobile corretta: solo guardando indietro
-    window_size = 10
-    velocity_smoothed = np.zeros(len(velocity_values), dtype=np.float32)
-    for i in range(len(velocity_values)):
-        start_idx = max(0, i - window_size + 1)
-        velocity_smoothed[i] = velocity_values[start_idx:i+1].mean()
-    
-    # Mappatura esponenziale vettorizzata
-    exponent = 10.0
-    velocity_values_exp = np.power(velocity_smoothed, exponent)
-    
-    # Controllo pause vettorizzato
-    time_gaps = np.diff(onset_times)
-    beat_gaps = np.abs(np.diff(beat_positions))
-    pause_mask = (time_gaps > 2.0) | (beat_gaps > 8.0)
-    
-    # Applica boost dove necessario
-    velocity_values_exp[:-1][pause_mask] = np.minimum(
-        velocity_values_exp[:-1][pause_mask] + 0.2, 
-        1.0
-    )
-    
-    # Normalizza contrast
-    if spectral_freqs.size > 0:
-        min_freq = spectral_freqs.min()
-        max_freq = spectral_freqs.max()
-        if max_freq > min_freq:
-            contrast_normalized = (spectral_freqs - min_freq) / (max_freq - min_freq)
-        else:
-            contrast_normalized = np.full_like(spectral_freqs, 0.5)
+
+    onset_times = np.array([g['onset_time'] for g in grouped], dtype=np.float32)
+    beat_positions = np.array([g['beat_position'] for g in grouped], dtype=np.float32)
+    velocity = np.array([g['velocity_value'] for g in grouped], dtype=np.float32)
+    spectral = np.array([g['spectral_mean_freq'] for g in grouped], dtype=np.float32)
+    release = np.array([g['release_time'] for g in grouped], dtype=np.float32)
+
+    # Smooth retroattivo
+    win = 10
+    v_smooth = np.zeros_like(velocity)
+    for i in range(len(velocity)):
+        s = max(0, i - win + 1)
+        v_smooth[i] = velocity[s:i+1].mean()
+
+    v_exp = np.power(v_smooth, 10.0)
+
+    if onset_times.size > 1:
+        gaps = np.diff(onset_times)
+        beat_gaps = np.abs(np.diff(beat_positions))
+        mask = (gaps > 2.0) | (beat_gaps > 8.0)
+        v_exp[:-1][mask] = np.minimum(v_exp[:-1][mask] + 0.2, 1.0)
+
+    # Contrast normalizzato
+    if spectral.size > 0:
+        mn, mx = spectral.min(), spectral.max()
+        contrast = (spectral - mn) / (mx - mn) if mx > mn else np.full_like(spectral, 0.5)
     else:
-        contrast_normalized = np.array([])
-    
-    # Calcola spread basato sulla release (lineare, direttamente proporzionale)
-    if release_times.size > 0:
-        min_release = release_times.min()
-        max_release = release_times.max()
-        if max_release > min_release:
-            spread_normalized = (release_times - min_release) / (max_release - min_release)
-        else:
-            spread_normalized = np.full_like(release_times, 0.5)
+        contrast = np.array([])
+
+    # Spread (release time)
+    if release.size > 0:
+        rmn, rmx = release.min(), release.max()
+        spread = (release - rmn) / (rmx - rmn) if rmx > rmn else np.full_like(release, 0.5)
     else:
-        spread_normalized = np.array([])
-    
-    # Crea dizionario con tutti i dati
-    analysis_data = {
+        spread = np.array([])
+
+    return {
         'filename': filename,
-        'num_onsets': n,
+        'num_onsets': int(onset_times.size),
         'onset_times': onset_times.tolist(),
         'beat_positions': beat_positions.tolist(),
-        'onset_strength': velocity_values_exp.tolist(),
-        'onset_contrast': contrast_normalized.tolist(),
-        'onset_spread': spread_normalized.tolist()
+        'onset_strength': v_exp.tolist(),
+        'onset_contrast': contrast.tolist(),
+        'onset_spread': spread.tolist()
     }
-    
-    print(f"✓ {n} onset preparati per JSON")
-    return analysis_data
 
-def save_analysis_to_json(filename, bpm, analysis_data, output_dir=OUTPUT_JSON_DIR):
-    """Salva i dati di analisi in un file JSON."""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Crea nome file JSON basato sul nome del file audio
-    base_name = os.path.splitext(filename)[0]
-    json_filename = f"{base_name}_analysis.json"
-    json_path = os.path.join(output_dir, json_filename)
-    
-    # Prepara il documento JSON completo
-    json_data = {
-        'filename': filename,
+def save_analysis_json(stem_path: str, bpm: float, data: dict, target_dir: Path) -> Path:
+    ensure_dir(target_dir)
+    base = Path(stem_path).stem
+    out = target_dir / f"{base}_analysis.json"
+    payload = {
+        'filename': stem_path,
         'bpm': float(bpm),
-        'analysis': analysis_data
+        'analysis': data
     }
-    
-    # Salva il file JSON
-    try:
-        with open(json_path, 'w') as f:
-            json.dump(json_data, f, indent=2)
-        print(f"💾 JSON salvato: {json_path}")
-        return json_path
-    except Exception as e:
-        print(f"❌ Errore salvataggio JSON: {e}")
-        return None
+    out.write_text(json.dumps(payload, indent=2))
+    log.info(f"JSON salvato: {out}")
+    return out
 
-def analyze_folder_to_json(folder_path, output_dir=OUTPUT_JSON_DIR):
-    """Analizza tutti i file in una cartella e salva i risultati in JSON."""
-    print(f"\n📁 Analisi parallela cartella: {folder_path}")
-    
-    if not os.path.isdir(folder_path):
-        print(f"❌ Path non valido: {folder_path}")
+# ---------------------------------------
+# ANALISI CARTELLA / FILE
+# ---------------------------------------
+def analyze_folder(folder: str) -> list:
+    """
+    Analizza tutti i file audio in una cartella (solo stems generati).
+    Salva ogni JSON nella cartella stessa.
+    """
+    dirp = safe_path(Path(folder))
+    if not dirp.is_dir():
+        log.error(f"Cartella non valida: {dirp}")
         return []
-    
-    # Trova file audio
-    audio_files = []
-    for filename in sorted(os.listdir(folder_path)):
-        ext = os.path.splitext(filename)[1].lower()
-        if ext in VALID_EXTENSIONS:
-            audio_files.append(os.path.join(folder_path, filename))
-    
+
+    # Prende solo file audio (non filtra per nome, ma se la cartella è stems contiene i 4)
+    audio_files = sorted(f for f in dirp.iterdir() if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS)
     if not audio_files:
-        print("❌ Nessun file audio trovato")
+        log.warning("Nessun file audio da analizzare.")
         return []
-    
-    print(f"📊 {len(audio_files)} file da analizzare (parallelo, {MAX_WORKERS} worker)")
-    
+
+    results = []
     valid_bpms = []
-    completed = 0
-    json_files = []
-    
-    # Elaborazione parallela con ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit tutti i task
-        future_to_file = {
-            executor.submit(analyze_single_file_cached, fp): fp 
-            for fp in audio_files
-        }
-        
-        # Processa risultati man mano che completano
-        for future in as_completed(future_to_file):
-            file_path = future_to_file[future]
-            filename = os.path.basename(file_path)
-            
+
+    log.info(f"Analisi parallela: {len(audio_files)} file")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        fut_map = {ex.submit(analyze_file, str(f)): f for f in audio_files}
+        for fut in as_completed(fut_map):
+            f = fut_map[fut]
             try:
-                is_valid, bpm, grouped_data = future.result()
-                completed += 1
-                
-                print(f"[{completed}/{len(audio_files)}] {filename} - BPM: {bpm:.1f}")
-                
+                is_valid, bpm, grouped = fut.result()
                 if is_valid and bpm > 0:
                     valid_bpms.append(bpm)
-                
-                # Prepara e salva i dati in JSON
-                analysis_data = prepare_analysis_data(filename, grouped_data)
-                json_path = save_analysis_to_json(filename, bpm, analysis_data, output_dir)
-                
-                if json_path:
-                    json_files.append(json_path)
-                
+                data = prepare_json_analysis(f.name, bpm, grouped)
+                save_analysis_json(str(f), bpm, data, dirp)
+                log.info(f"[Analizzato] {f.name} BPM={bpm:.1f}")
+                results.append(f)
             except Exception as e:
-                print(f"❌ Errore analisi {filename}: {e}")
-    
-    # BPM globale
+                log.error(f"Errore analisi {f.name}: {e}")
+
     if valid_bpms:
-        global_bpm = float(np.median(valid_bpms))
-        print(f"✓ BPM globale: {global_bpm:.1f}")
-    else:
-        global_bpm = 0.0
-    
-    print(f"✓ Analisi parallela completata - {len(json_files)} file JSON creati\n")
-    return json_files
+        gbpm = float(np.median(valid_bpms))
+        log.info(f"BPM globale (mediana): {gbpm:.1f}")
+    return [str(f) for f in results]
 
-def analyze_file_to_json(file_path, output_dir=OUTPUT_JSON_DIR):
-    """Analizza un singolo file e salva il risultato in JSON."""
-    filename = os.path.basename(file_path)
-    
-    print(f"\n🎵 Analisi file: {filename}")
-    
-    is_valid, bpm, grouped_data = analyze_single_file_cached(file_path)
-    
-    print(f"BPM: {bpm:.1f}")
-    
-    # Prepara e salva i dati in JSON
-    analysis_data = prepare_analysis_data(filename, grouped_data)
-    json_path = save_analysis_to_json(filename, bpm, analysis_data, output_dir)
-    
-    if json_path:
-        print(f"✓ Analisi completata\n")
-        return json_path
-    else:
-        print(f"❌ Errore durante il salvataggio\n")
+def analyze_file_to_json(path: str) -> Path | None:
+    fp = safe_path(Path(path))
+    if not fp.is_file():
+        log.error(f"File non valido: {fp}")
         return None
+    is_valid, bpm, grouped = analyze_file(str(fp))
+    data = prepare_json_analysis(fp.name, bpm, grouped)
+    return save_analysis_json(str(fp), bpm, data, fp.parent)
 
+# ---------------------------------------
+# CACHE UTILS
+# ---------------------------------------
 def clear_cache():
-    """Pulisce la cache."""
-    try:
-        if os.path.exists(CACHE_DIR):
-            import shutil
-            shutil.rmtree(CACHE_DIR)
-            print("✓ Cache pulita")
-            return True
-        else:
-            print("⚠️ Cache già vuota")
-            return False
-    except Exception as e:
-        print(f"❌ Errore pulizia cache: {e}")
-        return False
+    p = Path(CACHE_DIR)
+    if p.exists():
+        shutil.rmtree(p)
+        log.info("Cache pulita")
+    else:
+        log.info("Cache già vuota")
 
+# ---------------------------------------
+# MAIN
+# ---------------------------------------
 def main():
-    """Funzione principale unificata - esegue separazione + analisi insieme di default."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description='Tool unificato per separazione stems e analisi audio (workflow completo di default)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Esempi:
-    # Workflow completo automatico (DEFAULT): separa + analizza
+    ap = argparse.ArgumentParser(
+        description="Separazione 4 stems + Analisi onset (locale, stessa cartella)",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""Esempi:
+  Workflow completo:
     python ambisonics_automation.py song.mp3
-    python ambisonics_automation.py song.mp3 --output-stems custom_stems/ --output-json custom_json/
-    
-    # Solo separazione (senza analisi)
+
+  Solo separazione:
     python ambisonics_automation.py song.mp3 --no-analyze
-    
-    # Solo analisi (stems già esistenti)
-    python ambisonics_automation.py --analyze-only --folder stems/song_name/
-    python ambisonics_automation.py --analyze-only --file stems/song_name/drums.wav
-    
-    # Pulisci la cache
+
+  Forza nuova separazione (rigenera stems):
+    python ambisonics_automation.py song.mp3 --force
+
+  Solo analisi cartella stems:
+    python ambisonics_automation.py --analyze-only --folder /path/stems/song/
+
+  Solo analisi singolo stem:
+    python ambisonics_automation.py --analyze-only --file /path/stems/song/drums.wav
+
+  Pulisci cache:
     python ambisonics_automation.py --clear-cache
-        """
+"""
     )
-    
-    # Argomento principale: file audio (opzionale se si usa --analyze-only o --clear-cache)
-    parser.add_argument('input', nargs='?', help='File audio da processare (separazione + analisi)')
-    
-    # Opzioni per separazione
-    parser.add_argument('--output-stems', default=None, 
-                       help='Directory output stems (default: stems/nome_brano/)')
-    parser.add_argument('-d', '--device', choices=['mps', 'cuda', 'cpu'], default=None,
-                       help='Device per separazione (default: auto-detect)')
-    parser.add_argument('--no-analyze', action='store_true',
-                       help='Solo separazione stems, senza analisi')
-    
-    # Opzioni per analisi
-    parser.add_argument('--output-json', default=OUTPUT_JSON_DIR,
-                       help=f'Directory output JSON (default: {OUTPUT_JSON_DIR})')
-    parser.add_argument('--analyze-only', action='store_true',
-                       help='Solo analisi, senza separazione stems')
-    parser.add_argument('--folder', help='Cartella da analizzare (con --analyze-only)')
-    parser.add_argument('--file', help='File singolo da analizzare (con --analyze-only)')
-    
-    # Utilità
-    parser.add_argument('--clear-cache', action='store_true',
-                       help='Pulisce la cache delle analisi')
-    
-    args = parser.parse_args()
-    
-    # Clear cache
+    ap.add_argument("input", nargs="?", help="File audio di input (workflow completo se presente)")
+    ap.add_argument("--no-analyze", action="store_true", help="Esegui solo separazione (niente JSON)")
+    ap.add_argument("--analyze-only", action="store_true", help="Salta separazione, analizza cartella o file")
+    ap.add_argument("--folder", help="Cartella da analizzare (con --analyze-only)")
+    ap.add_argument("--file", help="File singolo da analizzare (con --analyze-only)")
+    ap.add_argument("--device", choices=["mps", "cuda", "cpu"], help="Forza device Demucs")
+    ap.add_argument("--force", action="store_true", help="Rigenera stems anche se esistono")
+    ap.add_argument("--clear-cache", action="store_true", help="Pulisce la cache analisi")
+
+    args = ap.parse_args()
+
+    # Cache
     if args.clear_cache:
         clear_cache()
         return 0
-    
-    # Solo analisi
+
+    # Modalità analisi-only
     if args.analyze_only:
         if args.folder:
-            json_files = analyze_folder_to_json(args.folder, args.output_json)
-            print(f"\n✅ Creati {len(json_files)} file JSON in {args.output_json}/")
+            analyze_folder(args.folder)
             return 0
-        elif args.file:
-            json_path = analyze_file_to_json(args.file, args.output_json)
-            if json_path:
-                print(f"\n✅ File JSON creato: {json_path}")
-                return 0
-            else:
-                return 1
-        else:
-            print("❌ Errore: con --analyze-only specifica --folder o --file")
-            return 1
-    
-    # Workflow completo o solo separazione
-    if not args.input:
-        parser.print_help()
+        if args.file:
+            analyze_file_to_json(args.file)
+            return 0
+        log.error("Con --analyze-only specifica --folder oppure --file")
         return 1
-    
+
+    # Serve input file
+    if not args.input:
+        ap.print_help()
+        return 1
+
     try:
-        # STEP 1: Separazione stems
-        if args.output_stems is None:
-            song_name = get_song_name(args.input)
-            stems_dir = os.path.join("stems", song_name)
-        else:
-            stems_dir = args.output_stems
-        
-        logger.info("\n" + "="*70)
-        logger.info("🎵 STEP 1/2: SEPARAZIONE STEMS")
-        logger.info("="*70)
-        
-        stem_paths = separate_4stems(
-            args.input,
-            output_dir=stems_dir,
-            device=args.device
-        )
-        
-        print("\n✅ Separazione completata!")
-        print(f"📁 Stems salvati in: {stems_dir}/")
-        
-        # STEP 2: Analisi (se non disabilitata)
-        if not args.no_analyze:
-            logger.info("\n" + "="*70)
-            logger.info("📊 STEP 2/2: ANALISI STEMS → JSON")
-            logger.info("="*70)
-            
-            json_files = analyze_folder_to_json(stems_dir, args.output_json)
-            
-            print("\n" + "="*70)
-            print("✅ WORKFLOW COMPLETO!")
-            print("="*70)
-            print(f"📁 Stems: {stems_dir}/")
-            print(f"📄 JSON: {args.output_json}/")
-            print(f"📊 File JSON creati: {len(json_files)}")
-            print("\nFile JSON:")
-            for json_file in json_files:
-                print(f"   • {os.path.basename(json_file)}")
-            print("\n💡 Carica in SuperCollider:")
-            print(f'   var data = "{args.output_json}/vocals_analysis.json".parseJSONFile;')
-        else:
-            print(f"\n💡 Per analizzare gli stems, esegui:")
-            print(f"   python ambisonics_automation.py --analyze-only --folder {stems_dir}/")
-        
+        # Separazione
+        log.info("="*70)
+        log.info("STEP 1/2: Separazione stems")
+        log.info("="*70)
+
+        stems_paths = separate_4stems(args.input, force=args.force, device=args.device)
+        stems_dir = stems_dir_for_input(args.input)
+        log.info(f"Stems directory: {stems_dir}")
+
+        if args.no_analyze:
+            log.info("Separazione completata (analisi disabilitata).")
+            return 0
+
+        # Analisi
+        log.info("="*70)
+        log.info("STEP 2/2: Analisi stems -> JSON")
+        log.info("="*70)
+
+        analyze_folder(str(stems_dir))
+
+        log.info("="*70)
+        log.info("WORKFLOW COMPLETO")
+        log.info("="*70)
+        log.info(f"Cartella finale: {stems_dir}")
+        for s in STEM_NAMES:
+            sp = stems_paths.get(s)
+            if sp:
+                log.info(f"  - {Path(sp).name}")
+        log.info("JSON generati nella stessa cartella.")
+
         return 0
-        
+
     except Exception as e:
-        logger.error(f"\n❌ Errore fatale: {e}")
+        log.error(f"Errore fatale: {e}")
         return 1
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
