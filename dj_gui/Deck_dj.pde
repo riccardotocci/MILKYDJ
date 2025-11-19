@@ -77,34 +77,46 @@ class Deck {
 
   void setPeer(Deck other) { this.peer = other; }
 
-// --- METODO loadAudioFile (versione semplificata che usa il metodo esistente) ---
+// In Deck_dj.pde, nel metodo loadAudioFile (dopo Buffer.readChannel):
+
 void loadAudioFile(java.io.File f) {
-  trackTitle = f.getName();
-  analysis = null;
-  analysisError = null;
-  isAnalyzing = true;
-  playheadSec = 0;
+    trackTitle = f.getName();
+    analysis = null;
+    analysisError = null;
+    isAnalyzing = true;
+    playheadSec = 0;
 
-  loopEnabled = false;
-  loopInSec = -1;
-  loopOutSec = -1;
-  cuePointSec = 0;
+    loopEnabled = false;
+    loopInSec = -1;
+    loopOutSec = -1;
+    cuePointSec = 0;
 
-  new Thread(() -> {
-    try {
-      // Usa il metodo analyzeFile esistente, che legge già tutti i formati
-      analysis = new BPMAnalyzer().analyzeFile(f, p -> {});
-      playheadSec = 0;
-      println("[BPMAnalyzer] Analisi completata. BPM: " + analysis.bpm);
-    } catch (Exception ex) {
-      analysis = null;
-      analysisError = ex.getMessage();
-      println("Errore analisi: " + ex);
-      ex.printStackTrace();
-    } finally {
-      isAnalyzing = false;
-    }
-  }).start();
+    new Thread(() -> {
+        try {
+            // Analisi BPM locale (Processing)
+            analysis = new BPMAnalyzer().analyzeFile(f, p -> {});
+            playheadSec = 0;
+            println("[BPMAnalyzer] Analisi completata. BPM: " + analysis.bpm);
+            
+            // 🆕 Richiedi analisi OSC degli stems via Python
+            if (osc != null) {
+                // Calcola path della cartella stems
+                String parent = f.getParent();
+                String base = f.getName().replaceFirst("[.][^.]+$", ""); // rimuovi estensione
+                String stemsPath = parent + "/stems/" + base;
+                
+                osc.requestAnalyzeFolder(stemsPath);
+            }
+            
+        } catch (Exception ex) {
+            analysis = null;
+            analysisError = ex.getMessage();
+            println("Errore analisi: " + ex);
+            ex.printStackTrace();
+        } finally {
+            isAnalyzing = false;
+        }
+    }).start();
 }
 
   // --- TUTTO IL RESTO DEL TUO CODICE RIMANE IDENTICO ---

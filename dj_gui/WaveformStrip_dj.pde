@@ -62,6 +62,11 @@ class WaveformStrip {
   void setBounds(float x, float y, float w, float h) { this.x = x; this.y = y; this.w = w; this.h = h; }
   void setPixelsPerBeat(float ppb) { pixelsPerBeat = max(10, ppb); }
   void setInvertControl(boolean inv) { invertControl = inv; }
+  
+  int waveColor = color(90, 200, 255);   // colore waveform
+  int beatDownbeatColor = color(255, 170, 80, 210); // opzionale, se vuoi differenziare
+  
+  void setWaveColor(int c) { waveColor = c; }
 
   // ------------------------------
   // Update (placeholder)
@@ -112,7 +117,7 @@ class WaveformStrip {
     float cy = y + h/2f;
 
     if (A == null || A.wfMin == null || A.wfMax == null) {
-      stroke(90, 200, 255, 120);
+      stroke(waveColor, 120);
       line(x + 6, cy, x + w - 6, cy);
       return;
     }
@@ -127,7 +132,7 @@ class WaveformStrip {
     int cols = max(1, int(w - 12));
     float tNow = deck.playheadSec;
 
-    stroke(90, 200, 255);
+    stroke(waveColor);
     strokeWeight(1);
 
     for (int i = 0; i < cols; i++) {

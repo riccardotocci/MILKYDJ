@@ -26,7 +26,10 @@ ServerOptions.outDevices;   // o: ServerOptions.devices;
 
 // imposta solo l'output
 Server.default.options.outDevice_("Altoparlanti MacBook Pro");
-Server.default.options.outDevice_("Cuffie esterne");
+Server.default.options.outDevice_("IT663x1");
+Server.default.options.numOutputBusChannels = 8;  // quante uscite fisiche userai
+// (alcune build richiedono anche:)
+Server.default.options.numOutputChannels = 8;
 (
 // ================== SETTINGS ==================
 ~order = 3;
@@ -35,15 +38,19 @@ Server.default.options.outDevice_("Cuffie esterne");
     encoder: "StereoEncoder",
     binauralDecoder: "BinauralDecoder",
     simpleDecoder: "SimpleDecoder",
-    reverb:  "FdnReverb"
+    reverb: "FdnReverb"
 );
+~orderOut = 3;
+~outChannels = 8;  // numero di canali di uscita desiderati per il simpleDecoder
 
 // IEM StereoEncoder params: azimuth=6, elevation=7
 ~encoderAzParam = 6;
 ~encoderElParam = 7;
 
+~meterRate = 20; // Hz per l’aggiornamento dei livelli encoder
+
 // Decoder selection: 'binaural' or 'simple'
-~decoderType = 'binaural';
+~decoderType = \simpleDecoder;
 
 // === Processing / OSC peer ===
 ~processingHost = "127.0.0.1";
@@ -54,10 +61,114 @@ Server.default.options.outDevice_("Cuffie esterne");
 ~scOscInPort = NetAddr.langPort;
 
 // Uscite cuffie (hw out index). Se usi interfacce multi-out, imposta p.es. 2 per usare out 2-3
-~phonesOut = 0;  // canale di partenza (stereo -> out, out+1)
+~phonesOut = 10;  // canale di partenza (stereo -> out, out+1)
 
 // Cartella di default (non usata nel nuovo load, lasciata per compatibilità)
 ~defaultFolder = "";
+
+~files = Dictionary.new;
+~filesFinalizedCount = 0;
+~expectedFiles = 0;
+~globalBPM = nil;
+
+// Dati di analisi da Python (stessa logica di ambisonics_onset)
+~files = Dictionary.new;    // name -> entry (bpm, chunks, arrays, timeline)
+~expectedFiles = 0;
+~filesFinalizedCount = 0;
+~globalBPM = nil;
+
+// Trova una traccia caricata a partire dal basename (es. "drums.wav")
+~trackByBaseName = { |base|
+    ~tracks.detect { |x|
+        var p = x[\path];
+        p.notNil and: { PathName(p).fileName == base }
+    }
+};
+
+// Crea l’entry per un file di analisi se non esiste
+~ensureFileEntry = { |name|
+    if(~files[name].isNil) {
+        ~files[name] = (
+            bpm: nil,
+            chunks: (
+                times:    Dictionary.new,
+                pos:      Dictionary.new,
+                flux:     Dictionary.new,
+                contrast: Dictionary.new
+            ),
+            onsetTimes:    #[],
+            onsetPos:      #[],
+            onsetFlux:     #[],
+            onsetContrast: #[],
+            timeline: #[],
+            routine: nil,
+            finalized: false
+        );
+    };
+};
+
+// Ricostruisce un array a partire dai chunk (dict: idx -> valori[])
+~rebuildArrayFromChunks = { |dict|
+    var keys = dict.keys.asArray.sort;
+    var acc  = Array.new;
+    keys.do { |k| acc = acc.addAll(dict[k]) };
+    acc
+};
+
+// Ricostruisce la timeline completa quando tutti i chunk del file sono arrivati
+~finalizeFile = { |name|
+    var e = ~files[name];
+    var ch, n;
+
+    if(e.isNil) {
+        ("[SC][WARN] finalize: missing entry for '%'".format(name)).postln;
+        ^nil;
+    };
+
+    ch = e[\chunks];
+
+    e[\onsetTimes]    = ~rebuildArrayFromChunks.(ch[\times]);
+    e[\onsetPos]      = ~rebuildArrayFromChunks.(ch[\pos]);
+    e[\onsetFlux]     = ~rebuildArrayFromChunks.(ch[\flux]);
+    e[\onsetContrast] = ~rebuildArrayFromChunks.(ch[\contrast]);
+
+    n = [
+        e[\onsetTimes].size,
+        e[\onsetPos].size,
+        e[\onsetFlux].size,
+        e[\onsetContrast].size
+    ].minItem;
+
+    if(n <= 0) {
+        ("[SC][WARN] empty timeline for '%'".format(name)).postln;
+        ^nil;
+    };
+
+    e[\onsetTimes]    = e[\onsetTimes].copyRange(0, n-1);
+    e[\onsetPos]      = e[\onsetPos].copyRange(0, n-1);
+    e[\onsetFlux]     = e[\onsetFlux].copyRange(0, n-1);
+    e[\onsetContrast] = e[\onsetContrast].copyRange(0, n-1);
+
+    e[\timeline] = Array.fill(n, { |i|
+        (
+            time:     e[\onsetTimes][i],
+            beat:     e[\onsetPos][i],
+            flux:     e[\onsetFlux][i],
+            contrast: e[\onsetContrast][i]
+        )
+    });
+
+    e[\finalized] = true;
+    ~files[name] = e;
+
+    ~filesFinalizedCount = ~filesFinalizedCount + 1;
+
+    ("[SC] Finalized file '%': N=% | BPM=%"
+        .format(name, n, (e[\bpm] ? "nil"))).postln;
+
+    // stampa qualche evento per debug
+    e[\timeline].copyRange(0, (n-1).clip(0, 7)).do(_.postln);
+};
 
 // ================== GLOBALS ==================
 ~ambiMasterBus = nil;
@@ -69,12 +180,6 @@ Server.default.options.outDevice_("Cuffie esterne");
 ~tracks = List.new;    // lista di tracce (Event) caricate (stems)
 ~recorder = nil;
 ~recording = false;
-
-// analisi da JSON: name(basename) -> entry (bpm, arrays...)
-~files = Dictionary.new;
-~expectedFiles = 0;
-~filesFinalizedCount = 0;
-~globalBPM = nil;
 
 // stato run globale (compat)
 ~isPlaying = false;
@@ -97,110 +202,11 @@ Server.default.options.outDevice_("Cuffie esterne");
     1 / max(1, count + 1)
 };
 
-// basename -> track
-~trackByBaseName = { |base|
-    ~tracks.detect { |x| PathName(x[\path]).fileName == base }
-};
-
-// assicura un entry analisi
-~ensureFileEntry = { |name|
-    if(~files[name].isNil) {
-        ~files[name] = (
-            bpm: nil,
-            onsetTimes: #[],
-            onsetPos: #[],
-            onsetFlux: #[],
-            onsetContrast: #[],
-            timeline: #[],
-            routine: nil,
-            finalized: false
-        );
-    };
-};
-
 // Stable percussion detection via filename
 ~isPercussionTrack = { |path|
     var filename = PathName(path).fileName.asString;
     var lower = filename.toLower;
     (lower.contains("drum") or: { lower.contains("kick") } or: { lower.contains("perc") } or: { lower.contains("bd") })
-};
-
-// JSON helpers (no direct reference to JSON class names)
-~jsonFindClass = {
-    var names, cls;
-    names = ["JSON", "JSONlib", "SimpleJSON", "SCJson", "WispJSON"];
-    cls = names.collect { |n| n.asSymbol.asClass }.detect(_.notNil);
-    cls
-};
-
-~jsonParseText = { |text|
-    var cls, sel, candidates, parsed, inst, tried;
-    parsed = nil;
-
-    cls = ~jsonFindClass.();
-    if(cls.isNil) {
-        "[SC][ERR] Nessuna classe JSON trovata (installa un quark JSON e ricompila).".warn;
-        ~processing.sendMsg('/dj3d/error', "json_quark_missing");
-        ^nil;
-    };
-
-    // 1) prova metodi di classe
-    candidates = [\parse, \fromString, \read, \newFromString];
-    sel = candidates.detect { |s| cls.respondsTo(s) };
-    if(sel.notNil) {
-        tried = sel;
-        ^{
-            parsed = cls.perform(sel, text);
-        }.try({ |err|
-            "[SC][ERR] JSON class method % fallito: %".format(tried, err).warn;
-            parsed = nil;
-        });
-    };
-    if(parsed.notNil) { ^parsed };
-
-    // 2) prova metodi di istanza
-    inst = ({
-        cls.new
-    }.try({ nil }));
-    if(inst.notNil) {
-        candidates = [\parse, \fromString, \read];
-        sel = candidates.detect { |s| inst.respondsTo(s) };
-        if(sel.notNil) {
-            tried = sel;
-            ^{
-                parsed = inst.perform(sel, text);
-            }.try({ |err|
-                "[SC][ERR] JSON instance method % fallito: %".format(tried, err).warn;
-                parsed = nil;
-            });
-        };
-    };
-    if(parsed.notNil) { ^parsed };
-
-    "[SC][ERR] Nessun selettore compatibile trovato nella classe JSON: %".format(cls.asString).warn;
-    ~processing.sendMsg('/dj3d/error', "json_no_compatible_api");
-    nil
-};
-
-// trova JSON di analisi dentro la cartella stems: preferenze: <basename>.json, analysis.json, features.json, oppure primo .json
-~findAnalysisJson = { |stemsDir, basenameNoExt|
-    var candidates, found, js, pn;
-    if(File.exists(stemsDir).not) { ^nil };
-
-    candidates = [
-        stemsDir +/+ (basenameNoExt ++ ".json"),
-        stemsDir +/+ "analysis.json",
-        stemsDir +/+ "features.json"
-    ];
-
-    found = candidates.detect { |p| File.exists(p) };
-    if(found.notNil) { ^found };
-
-    pn = PathName(stemsDir);
-    js = pn.files.select { |f| f.extension.asString.toLower == "json" };
-    if(js.notEmpty) { ^js.first.fullPath };
-
-    nil
 };
 
 // ================== SYNTHDEFS ==================
@@ -209,9 +215,13 @@ SynthDef(\binauralDecoder, { | bus, out = 0 |
     Out.ar(out, VSTPlugin.ar(In.ar(bus, n), 2));
 }).add;
 
+// Sostituisci il simpleDecoder con questa versione
 SynthDef(\simpleDecoder, { | bus, out = 0 |
-    var n = ~numChannels;
-    Out.ar(out, VSTPlugin.ar(In.ar(bus, n), 2));
+    var n     = ~numChannels;              // HOA in ingresso
+    var outs  = ~outChannels.asInteger;    // numero uscite fisiche (costante al build)
+    var inS   = In.ar(bus, n);
+    var dec   = VSTPlugin.ar(inS, outs);   // QUI outs è un intero, NON un Control
+    Out.ar(out, dec);
 }).add;
 
 SynthDef(\stereoEncoder, { | bus = 0 |
@@ -260,53 +270,66 @@ SynthDef(\elevSmoother, { | outBus=0, targetDeg=90, lag=0.15 |
     Out.kr(outBus, norm);
 }).add;
 
+SynthDef(\encoderMeter, { | inbus=0, tid=0, rate=20 |
+    var sig = Mix(In.ar(inbus, 2));         // stereo fisso
+    var amp = Amplitude.kr(sig, 0.05, 0.5).clip(0, 1);
+    SendTrig.kr(Impulse.kr(rate), tid, amp);
+}).add;
+
 // ================== SERVER BOOT ==================
 s.waitForBoot({
     "Server booted. Scanning plugins…".postln;
     VSTPlugin.search(verbose: false);
 
-    // Verifica JSON senza nominare classi inesistenti
-    if(~jsonFindClass.().isNil) {
-        "[WARN] Nessuna classe JSON rilevata. Installa un quark JSON (es. 'JSON' o 'jsonlib') e poi Language > Recompile."
-        .warn;
-        ~processing.sendMsg('/dj3d/warn', "json_quark_missing");
-    };
 
     ~processing.sendMsg('/dj3d/hello', ~scOscInPort, ~order, ~numChannels);
 });
 
 // ================== MASTER AMBISONIC ==================
 ~setupAmbiMaster = {
-    var synthName, pluginName;
+    var synthName, pluginName, outCh;
 
     ~ambiMasterBus !? { ~ambiMasterBus.free };
     ~ambiMasterBus = Bus.audio(s, ~numChannels);
     ~ambiMasterGroup = Group.head(s);
     ~decoder !? { ~decoder.free };
 
-    synthName = (~decoderType == 'simple').if({ \simpleDecoder }, { \binauralDecoder });
-    pluginName = (~decoderType == 'simple').if({ ~pluginNames[\simpleDecoder] }, { ~pluginNames[\binauralDecoder] });
+    if(~decoderType == \simple) {
+        synthName  = \simpleDecoder;
+        pluginName = ~pluginNames[\simpleDecoder];
+        outCh      = ~outChannels.max(8);
+    } {
+        synthName  = \binauralDecoder;
+        pluginName = ~pluginNames[\binauralDecoder];
+        outCh      = 8;
+    };
 
+    // NOTA: niente \outCh qui
     ~decoder = VSTPluginController(
         Synth(synthName, [\bus, ~ambiMasterBus, \out, 0],
             target: ~ambiMasterGroup, addAction: \addToTail)
     ).open(pluginName);
 
     ~ambiMasterFXGroup = Group.before(~decoder.synth);
-    "Ambisonic master ready: %ch | Decoder: %".format(~numChannels, pluginName).postln;
-    ~processing.sendMsg('/dj3d/decoder', (~decoderType == 'simple').if({ "simple" }, { "binaural" }));
+
+    ("[SC] Ambi master ready: HOA=%ch -> OUT=%ch | decoder=% | plugin=%"
+        .format(~numChannels, outCh, ~decoderType, pluginName)).postln;
+
+    ~processing.sendMsg('/dj3d/decoder', (~decoderType.asString));
 };
 
 ~switchDecoder = { |newType|
-    var wasPlaying = ~isPlaying;
-    if(wasPlaying) { ~stopRun.() };
-    ~decoderType = newType;
+    var target = newType.asString.toLower.asSymbol;
+    if(target != \simple and: { target != \binaural }) {
+        "[SC] Unknown decoder type: %".format(target).warn; ^nil;
+    };
+    if(target == ~decoderType) {
+        ("[SC] Decoder già attivo (%), nessuno switch.".format(target)).postln;
+        ^nil;
+    };
+    ("[SC] Switching decoder: % -> %".format(~decoderType, target)).postln;
+    ~decoderType = target;
     ~setupAmbiMaster.();
-    ("[SC] Switched to % decoder".format(
-        (~decoderType == 'simple').if({ "SimpleDecoder" }, { "BinauralDecoder" })
-    )).postln;
-    ~processing.sendMsg('/dj3d/decoder', (~decoderType == 'simple').if({ "simple" }, { "binaural" }));
-    if(wasPlaying) { ~startRun.() };
 };
 
 ~addMasterReverb = {
@@ -320,106 +343,195 @@ s.waitForBoot({
 };
 
 // ================== TRACK (STEM) CREATION ==================
-~makeTrack = { |path, idx, deckId=nil|
-    var file, buf, ambiBus, grp, lfoBus, tr, numCh, elBus, elSmoothSynth, isPerc, synthName;
+~makeTrack = { |path, idx, deckId = nil|
+    // ==============================
+    // Variabili locali (tutte inizializzate)
+    // ==============================
+    var file        = nil;
+    var numCh       = 0;
+    var ambiBus     = nil;
+    var grp         = nil;
+    var lfoBus      = nil;
+    var elBus       = nil;
+    var elSmooth    = nil;
+    var isPerc      = false;
+    var synthName   = \stereoPlayer;
+    var tr          = nil;
+    var buf         = nil;
 
+    // ==============================
+    // Verifica file e canali
+    // ==============================
     file = SoundFile.openRead(path);
     numCh = file.numChannels;
-
-    if ((numCh != 1) and: (numCh != 2)) {
+    if((numCh != 1) and: (numCh != 2)) {
         ("[WARN] % is %ch, expected mono or stereo; skipping."
             .format(PathName(path).fileName, numCh)).warn;
-        file.close; ^nil;
+        file.close;
+        ^nil;
     };
     file.close;
 
+    // ==============================
+    // Allocazioni base
+    // ==============================
     ambiBus = Bus.audio(s, ~numChannels);
-    grp = Group.before(~ambiMasterGroup);
-    lfoBus = Bus.control(s, 1);
+    grp     = Group.before(~ambiMasterGroup);    // gruppo della traccia (prima del decoder master)
+    lfoBus  = Bus.control(s, 1);                 // bus controllo (azimuth LFO)
+    elBus   = Bus.control(s, 1);                 // bus elevation smoothing
 
+    // Percussione (filename based)
     isPerc = ~isPercussionTrack.(path);
-    ("[SC] Track: % | isPerc: % | deck: %".format(PathName(path).fileName, isPerc, deckId)).postln;
+    ("[SC] Track: % | isPerc: % | deck: %"
+        .format(PathName(path).fileName, isPerc, deckId)).postln;
 
-    elBus = Bus.control(s, 1);
-    elSmoothSynth = Synth.tail(grp, \elevSmoother, [
-        \outBus, elBus,
-        \targetDeg, (isPerc).if({ 0 }, { 90 }),
-        \lag, 0.15
+    // Elevation smoothing synth
+    elSmooth = Synth.tail(grp, \elevSmoother, [
+        \outBus,     elBus,
+        \targetDeg,  (isPerc).if({ 0 }, { 90 }),
+        \lag,        0.15
     ]);
 
-    tr = ();
-    tr[\index] = idx;
-    tr[\path] = path;
-    tr[\buf] = nil;
-    tr[\group] = grp;
-    tr[\ambiBus] = ambiBus;
-    tr[\player] = nil;
-    tr[\encoder] = nil;
-    tr[\lfoBus] = lfoBus;
-    tr[\lfoSynth] = nil;
-    tr[\lfoActive] = false;
-    tr[\numCh] = numCh;
-    tr[\elBus] = elBus;
-    tr[\elSmooth] = elSmoothSynth;
-    tr[\isPerc] = isPerc;
-    tr[\deck] = deckId;   // assegnazione al deck
+    // Player synth name (mono -> monoPlayer, stereo -> stereoPlayer)
+    synthName = (numCh == 1).if({ \monoPlayer }, { \stereoPlayer });
 
-    tr[\setAz] = { |x|
+    // ==============================
+    // Event traccia (tutti i campi inizializzati)
+    // ==============================
+    tr = ();
+    tr[\index]     = idx;
+    tr[\path]      = path;
+    tr[\deck]      = deckId;
+    tr[\numCh]     = numCh;
+
+    tr[\buf]       = nil;
+    tr[\group]     = grp;
+    tr[\ambiBus]   = ambiBus;
+    tr[\player]    = nil;
+    tr[\encoder]   = nil;
+
+    tr[\lfoBus]    = lfoBus;
+    tr[\lfoSynth]  = nil;
+    tr[\lfoActive] = false;
+
+    tr[\elBus]     = elBus;
+    tr[\elSmooth]  = elSmooth;
+    tr[\isPerc]    = isPerc;
+
+    tr[\deckIdx]   = nil;   // verrà impostato in ~loadStemsFolderToDeck
+    tr[\meter]     = nil;   // verrà creato dopo (non conosciamo ancora trigID tid)
+	tr[\meterTid]  = nil;   // <-- AGGIUNGI QUESTA RIGA
+
+    // ==============================
+    // Funzioni helper salvate nel track Event
+    // ==============================
+    tr[\setAz] = { |az|      // Imposta azimuth direttamente (se non percussivo)
         tr[\encoder].notNil.if {
-            if(tr[\isPerc]) { tr[\encoder].set(~encoderAzParam, 0.5) } {
-                tr[\encoder].set(~encoderAzParam, x)
+            if(tr[\isPerc]) {
+                tr[\encoder].set(~encoderAzParam, 0.5); // fisso perc
+            }{
+                tr[\encoder].set(~encoderAzParam, az);
             };
         };
     };
 
     tr[\mapAzToLfo] = {
         if(tr[\isPerc]) {
-            ("[SC] Percussion track, skipping Az LFO mapping for: %"
+            ("[SC] Perc track, skip Az LFO mapping: %"
                 .format(PathName(tr[\path]).fileName)).postln;
         }{
-            tr[\encoder].notNil.if { tr[\encoder].map(~encoderAzParam, tr[\lfoBus]) };
+            tr[\encoder].notNil.if {
+                tr[\encoder].map(~encoderAzParam, tr[\lfoBus]);
+            };
         };
     };
 
-    tr[\unmapAz] = { tr[\encoder].notNil.if { tr[\encoder].unmap(~encoderAzParam) } };
-    tr[\setLfoSynth] = { |synth| tr[\lfoSynth] = synth };
-    tr[\free] = {
-        tr[\lfoSynth].notNil.if { tr[\lfoSynth].free };
-        tr[\elSmooth].notNil.if { tr[\elSmooth].free };
-        tr[\buf].notNil.if { tr[\buf].free };
-        tr[\ambiBus].free;
-        tr[\group].free;
+    tr[\unmapAz] = {
+        tr[\encoder].notNil.if {
+            tr[\encoder].unmap(~encoderAzParam);
+        };
     };
 
-    buf = Buffer.readChannel(s, path,
-        channels: (numCh == 1).if { [0] } { [0, 1] },
-        action: { |b|
-            {
-                synthName = (numCh == 1).if { \monoPlayer } { \stereoPlayer };
-                tr[\buf] = b;
+    tr[\setLfoSynth] = { |synth|
+        tr[\lfoSynth] = synth;
+    };
 
-                tr[\player] = Synth.head(grp, synthName, [
-                    \out, ambiBus, \buf, b, \rate, 1, \amp, 0, \trig, 0, \startPos, 0
-                ]);
+tr[\free] = {
+    tr[\lfoSynth].notNil.if { tr[\lfoSynth].free; tr[\lfoSynth] = nil };
+    tr[\elSmooth].notNil.if { tr[\elSmooth].free; tr[\elSmooth] = nil };
+    tr[\meter].notNil.if { tr[\meter].free; tr[\meter] = nil };
+    tr[\encoder].notNil.if { tr[\encoder].free; tr[\encoder] = nil };
+    tr[\player].notNil.if { tr[\player].free; tr[\player] = nil };
+    tr[\buf].notNil.if { tr[\buf].free; tr[\buf] = nil };
+    tr[\ambiBus].notNil.if { tr[\ambiBus].free; tr[\ambiBus] = nil };
+    tr[\lfoBus].notNil.if { tr[\lfoBus].free; tr[\lfoBus] = nil };
+    tr[\elBus].notNil.if { tr[\elBus].free; tr[\elBus] = nil };
+    tr[\group].notNil.if { tr[\group].free; tr[\group] = nil };
+};
 
-                tr[\encoder] = VSTPluginController(
-                    Synth.tail(grp, \stereoEncoder, [\bus, ambiBus])
-                ).open(~pluginNames[\encoder], action: { |self|
-                    self.set(~encoderAzParam, (tr[\isPerc]).if({ 0.5 }, { 1.0.rand }));
-                    if(tr[\isPerc]) {
-                        self.set(~encoderElParam, 0.5);
-                    }{
-                        self.map(~encoderElParam, elBus);
-                    };
-                });
-                Synth.tail(grp, \ambiThrow, [\from, ambiBus, \to, ~ambiMasterBus]);
+    // ==============================
+    // Caricamento buffer + creazione player + encoder + throw
+    // ==============================
+    buf = Buffer.readChannel(
+        s,
+        path,
+        channels: (numCh == 1).if({ [0] }, { [0, 1] }),
+action: { |b|
+    {
+        tr[\buf] = b;
 
-                ~processing.sendMsg('/dj3d/track_loaded',
-                    tr[\index], PathName(tr[\path]).fileName, tr[\numCh], tr[\isPerc].asInteger, (deckId ?? "-").asString);
-            }.defer;
-        }
+        // Player all'inizio del group
+        tr[\player] = Synth.head(grp, synthName, [
+            \out,      ambiBus,
+            \buf,      b,
+            \rate,     1,
+            \amp,      0,
+            \trig,     0,
+            \startPos, 0
+        ]);
+
+        // ========================================
+        // METER: dopo il player, prima dell'encoder
+        // ========================================
+        if (tr[\meterTid].notNil) {
+            tr[\meter].notNil.if { tr[\meter].free };  // libera vecchio se esiste
+            tr[\meter] = Synth.after(tr[\player], \encoderMeter, [
+                \inbus, ambiBus.index,
+                \tid,   tr[\meterTid],
+                \rate,  ~meterRate
+            ]);
+        };
+
+        // Encoder (tail) + parametri
+        tr[\encoder] = VSTPluginController(
+            Synth.tail(grp, \stereoEncoder, [\bus, ambiBus])
+        ).open(~pluginNames[\encoder], action: { |ctrl|
+            ctrl.set(~encoderAzParam, (tr[\isPerc]).if({ 0.5 }, { 1.0.rand }));
+            if (tr[\isPerc]) {
+                ctrl.set(~encoderElParam, 0.5);
+            } {
+                ctrl.map(~encoderElParam, elBus);
+            };
+        });
+
+        // Throw ambisonico
+        Synth.tail(grp, \ambiThrow, [\from, ambiBus, \to, ~ambiMasterBus]);
+
+        // Notifica Processing
+        ~processing.sendMsg('/dj3d/track_loaded',
+            tr[\index],
+            PathName(tr[\path]).fileName,
+            tr[\numCh],
+            tr[\isPerc].asInteger,
+            (deckId ?? "-").asString
+        );
+    }.defer;
+}
     );
 
+    // ==============================
+    // Ritorna l'Event traccia
+    // ==============================
     tr;
 };
 
@@ -453,11 +565,6 @@ s.waitForBoot({
 
 // ================== RUN CONTROL (compat) ==================
 ~startRun = {
-    if(~filesFinalizedCount <= 0) {
-        "[SC] Nessuna analisi caricata. Carica un JSON prima di avviare.".warn;
-        ~processing.sendMsg('/dj3d/run_denied', "no_analysis_loaded");
-        ^nil;
-    };
 
     ~applyDeckStemsAmps.();
 
@@ -563,96 +670,6 @@ s.waitForBoot({
     routine.play(AppClock);
 };
 
-// ================== ANALYSIS: LOAD FROM JSON ==================
-~loadAnalysisFromJSON = { |jsonPath|
-    var jsonStr, data, filesArr, matched = 0, total = 0;
-
-    if(jsonPath.isNil or: { jsonPath.asString.isEmpty }) {
-        "[SC][ERR] JSON path non valido".warn;
-        ~processing.sendMsg('/dj3d/error', "json_path_invalid"); ^nil;
-    };
-
-    if(File.exists(jsonPath).not) {
-        "[SC][ERR] JSON non trovato: %".format(jsonPath).warn;
-        ~processing.sendMsg('/dj3d/error', "json_not_found", jsonPath); ^nil;
-    };
-
-    if(~jsonFindClass.().isNil) {
-        "[SC][ERR] Quark JSON mancante: impossibile fare il parse. Installa un quark JSON e ricompila."
-        .warn;
-        ~processing.sendMsg('/dj3d/error', "json_quark_missing");
-        ^nil;
-    };
-
-    jsonStr = File.readAllString(jsonPath);
-
-    data = ~jsonParseText.(jsonStr);
-    if(data.isNil) {
-        // error già notificato
-        ^nil;
-    };
-
-    // reset (ma NON liberiamo le tracce: il JSON si riferisce alle stems correnti)
-    ~files.clear;
-    ~filesFinalizedCount = 0;
-
-    ~globalBPM = (data[\global_bpm] ?? data["global_bpm"]).asFloat;
-    (~globalBPM.notNil).if { ~processing.sendMsg('/dj3d/global_bpm', ~globalBPM) };
-
-    filesArr = data[\files] ?? data["files"];
-    if(filesArr.isNil or: { filesArr.isArray.not }) {
-        "[SC][ERR] JSON: campo 'files' mancante o non array".warn;
-        ~processing.sendMsg('/dj3d/error', "json_schema_invalid"); ^nil;
-    };
-
-    total = filesArr.size;
-    filesArr.do { |entry|
-        var name, base, times, pos, flux, cntr, bpm, n;
-        name = (entry[\name] ?? entry["name"]).asString;
-        base = PathName(name).fileName; // normalizza a basename
-        times = (entry[\onset_times] ?? entry["onset_times"] ?? entry[\times] ?? entry["times"]) ? #[];
-        pos   = (entry[\onset_pos]   ?? entry["onset_pos"]   ?? entry[\pos]   ?? entry["pos"])   ? #[];
-        flux  = (entry[\onset_flux]  ?? entry["onset_flux"]  ?? entry[\flux]  ?? entry["flux"])  ? #[];
-        cntr  = (entry[\onset_contrast] ?? entry["onset_contrast"] ?? entry[\contrast] ?? entry["contrast"]) ? #[];
-        bpm   = (entry[\bpm] ?? entry["bpm"]).asFloat;
-
-        if(~trackByBaseName.(base).notNil) {
-            n = [times.size, pos.size, flux.size, cntr.size].minItem;
-            if(n <= 0) {
-                ("[SC][WARN] Timeline vuota per %".format(base)).postln;
-            }{
-                ~ensureFileEntry.(base);
-                ~files[base].putAll((
-                    bpm: bpm,
-                    onsetTimes: times.copyRange(0, n-1),
-                    onsetPos: pos.copyRange(0, n-1),
-                    onsetFlux: flux.copyRange(0, n-1),
-                    onsetContrast: cntr.copyRange(0, n-1),
-                    timeline: Array.fill(n, { |i|
-                        ( time: times[i], beat: pos[i], flux: flux[i], contrast: cntr[i] )
-                    }),
-                    finalized: true
-                ));
-                matched = matched + 1;
-                ~filesFinalizedCount = ~filesFinalizedCount + 1;
-                ~processing.sendMsg('/dj3d/file_finalized', base, n, bpm ?? -1);
-            };
-        }{
-            ("[SC][INFO] Analisi per % ignorata: stem non caricato".format(base)).postln;
-        };
-    };
-
-    ~expectedFiles = matched;
-    ("[SC] Analisi JSON caricata. Matched % / total %".format(matched, total)).postln;
-
-    if(matched > 0) {
-        ~processing.sendMsg('/dj3d/analysis_loaded', jsonPath, matched, total);
-        ~processing.sendMsg('/dj3d/play_enabled', 1, ~filesFinalizedCount, ~expectedFiles);
-    }{
-        ~processing.sendMsg('/dj3d/analysis_loaded', jsonPath, matched, total);
-        ~processing.sendMsg('/dj3d/play_enabled', 0, 0, 0);
-    };
-};
 
 // ================== 2 DECKS: LOGICA STEMS + CUE + TRANSPORT ==================
 ~deckCollectStems = { |id|
@@ -790,19 +807,44 @@ s.waitForBoot({
 
 // Libera stems appartenenti a un deck (prima di un nuovo load)
 ~deckClearStems = { |id|
-    var toRemove, d, base, e;
+    var toRemove, d;
+
+    // Seleziona le tracce da rimuovere
     toRemove = ~tracks.select { |t| t[\deck] == id };
-    // stop looping routine
+
+    // Ferma la routine di loop del deck, se attiva
     d = ~decks[id];
-    d[\loopRoutine].notNil.if { d[\loopRoutine].stop; d[\loopRoutine] = nil };
-    toRemove.do { |t|
-        // stop routine automazioni se presente
-        base = PathName(t[\path]).fileName;
-        e = ~files[base];
-        e.notNil.if { e[\routine].notNil.if { e[\routine].stop; e[\routine] = nil } };
+    if(d.notNil and: { d[\loopRoutine].notNil }) {
+        d[\loopRoutine].stop;
+        d[\loopRoutine] = nil;
+    };
+
+    // Itera sulle tracce da rimuovere
+toRemove.do { |t|
+    var base, e;
+
+    // --- INIZIO MODIFICA FONDAMENTALE ---
+    // Prima di liberare la traccia, trova e ferma la sua routine di automazione!
+    base = PathName(t[\path]).fileName;
+    e = ~files[base]; // Trova l'entry di analisi corrispondente
+
+    if(e.notNil and: { e[\routine].notNil }) {
+        e[\routine].stop; // Ferma la routine
+        e[\routine] = nil;  // Pulisci il riferimento
+        ("Stopped automation routine for old stem: %".format(base)).postln;
+    };
+        // --- FINE MODIFICA FONDAMENTALE ---
+
+        // Ora libera le risorse della traccia in sicurezza
         t[\free].();
+
+        // Rimuovi la traccia dalla lista globale
         ~tracks.remove(t);
     };
+
+    if(toRemove.size > 0) {
+        ("Cleared % stems from deck %.".format(toRemove.size, id)).postln;
+    }
 };
 
 // CUE controls (headphones file)
@@ -856,9 +898,9 @@ s.waitForBoot({
     ~processing.sendMsg('/dj3d/phones_out', ~phonesOut);
 };
 
-// Carica stems+json per un deck dato un "file" principale; NON avvia più il CUE
+// Carica stems per un deck dato un "file" principale; NON avvia più il CUE
 ~deckLoadFile = { |id, filePath|
-    var d, p, parentDir, baseNoExt, stemsDir, newStems, jsonPath, minFrames;
+    var d, p, parentDir, baseNoExt, stemsDir, newStems, minFrames;
 
     d = ~decks[id];
     if(d.isNil) {
@@ -900,13 +942,19 @@ s.waitForBoot({
     // carica stems nel deck
     newStems = ~loadStemsFolderToDeck.(stemsDir, id);
 
-    // 3) ANALYSIS JSON: dentro la cartella stems
-    jsonPath = ~findAnalysisJson.(stemsDir, baseNoExt);
-    if(jsonPath.notNil) {
-        ~loadAnalysisFromJSON.(jsonPath);
-    }{
-        "[SC][WARN] JSON analisi non trovato in: %".format(stemsDir).postln;
-        ~processing.sendMsg('/dj3d/warn', "json_not_found_in_stems", stemsDir);
+	~processing.sendMsg('/dj3d/deck/encoders', id.asString, newStems.size);
+
+    // CALCOLA trigID PRIMA di inviare i messaggi
+    newStems.do { |t, i|
+        var tid;
+        t[\deckIdx] = i;
+
+        // Calcola trigID per distinguere deck A (0..99) / B (100..199)
+        tid = (id == 'B').if({ 100 + i }, { i });
+        t[\meterTid] = tid;  // <-- SALVA qui, prima del buffer action
+
+        // Invia nome encoder (basename del file)
+        ~processing.sendMsg('/dj3d/deck/encoder', id.asString, i, PathName(t[\path]).fileName);
     };
 
     // init transport defaults for this deck
@@ -928,21 +976,73 @@ s.waitForBoot({
     ~processing.sendMsg('/dj3d/deck/loaded_file', id.asString, p.fullPath, stemsDir);
 };
 
-// Play/Pause deck (stems)
+// === AVVIO AUTOMATICO ROUTINE PER DECK ===
+~deckStartAllRoutines = { |id|
+    var stems, d;
+    d = ~decks[id];
+    if(d.isNil) { ^nil };
+
+    stems = ~deckCollectStems.(id);
+    if(stems.isEmpty) {
+        ("[SC] Deck % senza stems — nessuna routine da avviare".format(id)).postln;
+        ^nil;
+    };
+
+    ("[SC] Avvio routine per deck % (% stems)".format(id, stems.size)).postln;
+
+    stems.do { |t|
+        var base, e;
+        base = PathName(t[\path]).fileName;
+        e = ~files[base];
+
+        if(e.notNil and: { e[\finalized] }) {
+            // Se la routine non esiste già, avviala
+            if(e[\routine].isNil) {
+                ~startAutomationFor.(base);
+            };
+        }{
+            ("[SC][WARN] Analisi non finalizzata per: %".format(base)).warn;
+        };
+    };
+};
+
 ~deckPlay = { |id|
     var d, startSam;
-    d = ~decks[id]; if(d.isNil) { ^("[SC][ERR] Deck % non esiste".format(id)).warn };
-    // start from cue or loopIn if loop enabled
+    d = ~decks[id];
+    if(d.isNil) { ^("[SC][ERR] Deck % non esiste".format(id)).warn };
+
+    // Start from cue or loopIn if loop enabled
     startSam = (d[\loopEnabled]).if({ d[\loopInSam] }, { d[\cuePosSam] });
     ~deckStartFrom.(id, startSam);
+
+    // 🆕 AVVIA ROUTINE DI AUTOMAZIONE
+    ~deckStartAllRoutines.(id);
 };
 
 ~deckStop = { |id|
-    var d;
-    d = ~decks[id]; if(d.isNil) { ^("[SC][ERR] Deck % non esiste".format(id)).warn };
+    var d, stems;
+    d = ~decks[id];
+    if(d.isNil) { ^("[SC][ERR] Deck % non esiste".format(id)).warn };
+
     d[\playing] = false;
     d[\loopRoutine].notNil.if { d[\loopRoutine].stop; d[\loopRoutine] = nil };
     ~applyDeckStemsAmps.();
+
+    // 🆕 FERMA ROUTINE DI AUTOMAZIONE
+    stems = ~deckCollectStems.(id);
+    stems.do { |t|
+        var base, e;
+        base = PathName(t[\path]).fileName;
+        e = ~files[base];
+        if(e.notNil and: { e[\routine].notNil }) {
+            e[\routine].stop;
+            e[\routine] = nil;
+        };
+
+        // Ferma anche LFO azimuth
+        t[\lfoSynth].notNil.if { t[\lfoSynth].free; t[\lfoSynth] = nil; t[\lfoActive] = false };
+    };
+
     ~processing.sendMsg('/dj3d/deck/state', id.asString, 0);
 };
 
@@ -964,18 +1064,22 @@ s.waitForBoot({
 ~secToSam = { |tSec, buf| (tSec * (buf ? Buffer).sampleRate).asInteger };
 
 // --- Helper robusto per sample rate del deck ---
-~deckSampleRate = { |id| var d,t;
-    d = ~decks[id];
+~deckSampleRate = { |id|
+    var d = ~decks[id];
     // 1) se il buffer delle cuffie è pronto, usa quello
     if(d.notNil and: { d[\cueBuf].notNil }) { ^d[\cueBuf].sampleRate };
 
     // 2) altrimenti cerca il primo stem che ha il buffer pronto
-    t = ~deckCollectStems.(id).detect { |tr| tr[\buf].notNil };
-    if(t.notNil) { ^t[\buf].sampleRate };
+    ~deckCollectStems.(id).do { |t|
+        if(t[\buf].notNil) {
+            ^t[\buf].sampleRate;
+        };
+    };
 
     // 3) fallback sicuro
     44100
 };
+
 
 // --- Sostituisci queste funzioni con versioni che usano ~deckSampleRate ---
 
@@ -985,7 +1089,7 @@ s.waitForBoot({
     sr = ~deckSampleRate.(id);
     d[\cuePosSam] = (sec.clip(0, 1e9) * sr).asInteger;
 
-    // Se è fermo, arma silenzioso per allineare gli stems
+    // Se fermo, arma silenzioso gli stems (muted) a quella posizione
     if(d[\playing].not) {
         ~deckRetriggerAll.(id, d[\cuePosSam]);
     };
@@ -1012,7 +1116,6 @@ s.waitForBoot({
     if(d.isNil) { ^nil };
     sr = ~deckSampleRate.(id);
     d[\loopInSam] = (sec.clip(0, 1e9) * sr).asInteger;
-
     if(d[\loopOutSam] <= d[\loopInSam]) {
         d[\loopOutSam] = d[\loopInSam] + (sr * 0.5).asInteger; // default 0.5s
     };
@@ -1025,7 +1128,6 @@ s.waitForBoot({
     if(d.isNil) { ^nil };
     sr = ~deckSampleRate.(id);
     d[\loopOutSam] = (sec.clip(0, 1e9) * sr).asInteger;
-
     if(d[\loopOutSam] <= d[\loopInSam]) {
         d[\loopOutSam] = d[\loopInSam] + (sr * 0.5).asInteger;
     };
@@ -1074,7 +1176,7 @@ OSCdef(\dj3d_phones_out, { |msg|
     ~setPhonesOut.(outIdx);
 }, '/dj3d/phones/out');
 
-// Deck: carica file principale -> cuffie (preparato) + stems + json
+// Deck: carica file principale -> cuffie (preparato) + stems
 OSCdef(\dj3d_deck_load_file, { |msg|
     var id = msg[1].asString.asSymbol; // 'A' o 'B'
     var path = msg[2].asString;
@@ -1160,13 +1262,6 @@ OSCdef(\dj3d_crossfader, { |msg|
     ~setCrossfader.(x);
 }, '/dj3d/crossfader');
 
-// Analisi JSON manuale (se necessario)
-OSCdef(\dj3d_load_analysis, { |msg|
-    var jsonPath = msg[1].asString;
-    "OSC: /dj3d/load_analysis -> %".format(jsonPath).postln;
-    ~loadAnalysisFromJSON.(jsonPath);
-}, '/dj3d/load_analysis');
-
 // Compat global play/stop (non indispensabile coi deck)
 OSCdef(\dj3d_play, { |msg|
     "OSC: /dj3d/play (global)".postln;
@@ -1198,9 +1293,9 @@ OSCdef(\dj3d_add_reverb, { |msg|
 }, '/dj3d/add_reverb');
 
 OSCdef(\dj3d_switch_decoder, { |msg|
-    var t = msg[1].asString;
-    "OSC: /dj3d/switch_decoder -> %".format(t).postln;
-    if(t == "simple" or: { t == "binaural" }) { ~switchDecoder.(t) } { "[SC] Unknown decoder type".warn };
+    var t = msg[1].asString.asSymbol;
+    "OSC: /dj3d/switch_decoder -> % (class=%)".format(t, t.class).postln;
+    ~switchDecoder.(t);
 }, '/dj3d/switch_decoder');
 
 OSCdef(\dj3d_record, { |msg|
@@ -1254,50 +1349,11 @@ OSCdef(\dj3d_deck_speed, { |msg|
 }, '/dj3d/deck/speed');
 
 // === Helpers: seek in secondi con retrigger coerente ===
-~deckSeekSec = { |id, sec|
-    var d, stems, sr, targetSam;
-    d = ~decks[id]; if(d.isNil) { ^nil };
-    stems = ~deckCollectStems.(id);
-    sr = stems.first.notNil.if({ stems.first[\buf].sampleRate }, { 44100 });
-    targetSam = (sec.clip(0, 1e9) * sr).asInteger;
-
-    // aggiorna il cue del deck (lo riutilizziamo anche altrove)
-    d[\cuePosSam] = targetSam;
-
-    if(d[\playing]) {
-        // se sta suonando: riparti subito da targetSam
-        ~deckStartFrom.(id, targetSam);
-    }{
-        // se è fermo: riallinea gli stems a targetSam (muted) così sono “armati”
-        ~deckRetriggerAll.(id, targetSam);
-    };
-
-    ~processing.sendMsg('/dj3d/deck/seek_ack', id.asString, sec);
-};
 
 // === CONTROL VIA OSC: aggiunte dedicate ===
 
 // Imposta il CUE (solo aggiorna d[\cuePosSam], non muove il playhead)
-OSCdef(\dj3d_deck_set_cue, { |msg|
-    var id = msg[1].asString.asSymbol;
-    var sec = msg[2].asFloat;
-    var d = ~decks[id];
-    var stems = ~deckCollectStems.(id);
-    var sr = stems.first.notNil.if({ stems.first[\buf].sampleRate }, { 44100 });
-    if(d.notNil) {
-        d[\cuePosSam] = (sec.clip(0, 1e9) * sr).asInteger;
-        ~processing.sendMsg('/dj3d/deck/cue_pos', id.asString, sec);
-    };
-    "OSC: /dj3d/deck/set_cue % -> %s".format(id, sec).postln;
-}, '/dj3d/deck/set_cue'); // se già c'è, puoi tenere l’OSCdef esistente
 
-// Seek “attivo”: sposta playhead alla posizione (se playing) o arma silenzioso (se fermo)
-OSCdef(\dj3d_deck_seek, { |msg|
-    var id = msg[1].asString.asSymbol;
-    var sec = msg[2].asFloat;
-    "OSC: /dj3d/deck/seek % -> %s".format(id, sec).postln;
-    ~deckSeekSec.(id, sec);
-}, '/dj3d/deck/seek');
 
 // CUE momentary (hold): 1 = press -> parte dal CUE; 0 = release -> stop e ritorna al CUE
 OSCdef(\dj3d_deck_cue_hold, { |msg|
@@ -1342,11 +1398,158 @@ OSCdef(\dj3d_deck_play, { |msg|
     };
 }, '/dj3d/deck/play');
 
+OSCdef(\dj3d_decoder_editor, { |msg|
+    var on = msg[1].asInteger;
+    "OSC: /dj3d/decoder/editor -> %".format(on).postln;
+
+    if(~decoder.isNil) {
+        "[SC] Decoder non inizializzato (chiama ~setupAmbiMaster)".warn;
+        ^nil;
+    };
+
+    if(~decoder.respondsTo(\editor)) {
+        ~decoder.editor(on.asBoolean);
+    }{
+        try {
+            if(on == 1) { ~decoder.showEditor } { ~decoder.hideEditor };
+        }{
+            "[SC] VSTPluginController: no editor()/showEditor/hideEditor available.".warn;
+        };
+    };
+}, '/dj3d/decoder/editor');
+
+OSCdef(\dj3d_encoder_meter_fwd, { |msg|
+    // SendTrig invia: ['/tr', nodeID, trigID, value]
+    var nodeID = msg[1];
+    var tid    = msg[2].asInteger;
+    var amp    = msg[3].asFloat;
+
+    // Decodifica: 0..99 => Deck A, 100..199 => Deck B
+    var deck = (tid >= 100).if({ 'B' }, { 'A' });
+    var idx  = tid % 100;
+
+    ~processing.sendMsg('/dj3d/deck/encoder_level', deck.asString, idx, amp);
+}, '/tr');
+
+OSCdef(\dj3d_deck_encoder_editor, { |msg|
+    var deck   = msg[1].asString.asSymbol;  // 'A' | 'B'
+    var idx    = msg[2].asInteger;         // deck-local index
+    var on     = msg[3].asInteger;
+
+    var tracks = ~deckCollectStems.(deck);
+    var tr = (idx >= 0 and: { idx < tracks.size }).if({ tracks[idx] }, { nil });
+
+    "OSC: /dj3d/deck/encoder/editor % % -> %".format(deck, idx, on).postln;
+
+    if(tr.isNil) { "[SC] Encoder track non trovata".warn; ^nil };
+
+    if(tr[\encoder].notNil) {
+        if(tr[\encoder].respondsTo(\editor)) {
+            tr[\encoder].editor(on.asBoolean);
+        }{
+            try {
+                (on == 1).if({ tr[\encoder].showEditor }, { tr[\encoder].hideEditor });
+            }{
+                "[SC] Encoder controller: no editor()/showEditor/hideEditor".warn;
+            };
+        };
+    }{
+        "[SC] Encoder non pronto per questo canale".warn;
+    };
+}, '/dj3d/deck/encoder/editor');
+
+// ================== RICEZIONE ANALISI VIA OSC (da Python) ==================
+
+// ================== OSC LISTENERS (analysis da Python) ==================
+
+// /analysis/start n_files
+OSCdef(\anaStart, { |msg|
+    ~files.clear;
+    ~expectedFiles = msg[1].asInteger;
+    ~filesFinalizedCount = 0;
+    ("[SC] /analysis/start | expected files = %".format(~expectedFiles)).postln;
+}, '/analysis/start');
+
+// /analysis/file_start name
+OSCdef(\fileStart, { |msg|
+    var name = msg[1].asString;
+    ~ensureFileEntry.(name);
+    ("[SC] /analysis/file_start | %".format(name)).postln;
+}, '/analysis/file_start');
+
+// /analysis/file_bpm name bpm
+OSCdef(\fileBPM, { |msg|
+    var name = msg[1].asString;
+    var bpm  = msg[2].asFloat;
+    ~ensureFileEntry.(name);
+    ~files[name].put(\bpm, bpm);
+    ("[SC] /analysis/file_bpm | % : %".format(name, bpm)).postln;
+}, '/analysis/file_bpm');
+
+// helper per chunk
+~storeChunk = { |msg, keySym|
+    var name = msg[1].asString;
+    var idx  = msg[2].asInteger;
+    var cnt  = msg[3].asInteger;
+    var vals = msg.copyToEnd(4).keep(cnt);
+    ~ensureFileEntry.(name);
+    ~files[name][\chunks][keySym][idx] = vals;
+    ("[SC] % | % | idx=% count=%"
+        .format(msg[0], name, idx, cnt)).postln;
+};
+
+// chunk stream
+OSCdef(\timesChunk, { |msg| ~storeChunk.(msg, \times)    }, '/analysis/onset_times_chunk');
+OSCdef(\posChunk,   { |msg| ~storeChunk.(msg, \pos)      }, '/analysis/onset_pos_chunk');
+OSCdef(\fluxChunk,  { |msg| ~storeChunk.(msg, \flux)     }, '/analysis/onset_strength_chunk');
+OSCdef(\cntrChunk,  { |msg| ~storeChunk.(msg, \contrast) }, '/analysis/onset_contrast_chunk');
+
+// /analysis/file_end name
+OSCdef(\fileEnd, { |msg|
+    var name = msg[1].asString;
+    ("[SC] /analysis/file_end | %".format(name)).postln;
+    ~finalizeFile.(name);
+}, '/analysis/file_end');
+
+// /analysis/global_bpm bpm
+OSCdef(\globalBPM, { |msg|
+    ~globalBPM = msg[1].asFloat;
+    ("[SC] /analysis/global_bpm | %".format(~globalBPM)).postln;
+}, '/analysis/global_bpm');
+
+// /analysis/end
+OSCdef(\anaEnd, { |msg|
+    "[SC] /analysis/end".postln;
+    ("[SC] Files received: % / expected: %"
+        .format(~files.keys.size, ~expectedFiles)).postln;
+
+    if((~expectedFiles > 0) and: { ~filesFinalizedCount >= ~expectedFiles }) {
+        ("[SC] Analysis complete: %/% files finalized."
+            .format(~filesFinalizedCount, ~expectedFiles)).postln;
+        // opzionale: notifica a Processing
+        ~processing.sendMsg('/analysis/ready', ~filesFinalizedCount);
+    }{
+        ("[SC] Analysis finished but %/% finalized."
+            .format(~filesFinalizedCount, ~expectedFiles)).postln;
+    };
+}, '/analysis/end');
+
+
+
+
+
+
+
+
+
+
+
+
 // Auto-setup master + decks (idle)
 ~setupAmbiMaster.();
 ~initDecks.();
 ~setCrossfader.(0.5);
-"DJ3D headless + JSON + 2 Decks + Stems Loader ready — listening on port %, sending to %:%"
+"DJ3D headless + 2 Decks + Stems Loader ready — listening on port %, sending to %:%"
     .format(~scOscInPort, ~processingHost, ~processingPort).postln;
 ~processing.sendMsg('/dj3d/ready', "<idle>", 0, ~order, ~numChannels);
 
@@ -1360,3 +1563,8 @@ OSCdef(\dj3d_deck_play, { |msg|
 // /dj3d/deck/play A ; /dj3d/deck/stop A
 // /dj3d/crossfader 0..1
 )
+~decoder.controller.postln;
+~decoder.info.postln;
+~decoder.parameters.do{|p| p.postln };
+s.meter;
+
