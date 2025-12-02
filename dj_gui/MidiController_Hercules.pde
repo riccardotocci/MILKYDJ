@@ -288,7 +288,7 @@ if (pitch == NOTE_CUE_H) {
       if (!d.playWasPlayingBeforeCue && !d.playLatchedDuringCue) {
         d.playBtn.setPlaying(false);
         d.playPause.state = false;
-        d.playheadSec = d.cuePointSec;
+        d.playheadSec = d.cuePointSec; // Ritorna al punto CUE (appena settato nel press)
       }
       d.cueHolding = false;
 
@@ -305,12 +305,17 @@ if (pitch == NOTE_CUE_H) {
   d.playWasPlayingBeforeCue = d.playBtn.getPlaying();
   d.playLatchedDuringCue = false;
 
-  if (!d.playWasPlayingBeforeCue && osc != null) {
-    osc.deckCueHold(d, true);
-    d.sentCueHoldToSC = true;
-  }
   if (!d.playWasPlayingBeforeCue) {
-    d.playheadSec = d.cuePointSec;
+    // --- MODIFICA: Aggiorna CUE alla posizione corrente ---
+    d.cuePointSec = d.playheadSec;
+    
+    if (osc != null) {
+        osc.deckSetCue(d, d.cuePointSec);
+        // MODIFICA FONDAMENTALE: invia ANCHE il timestamp esatto a CUE HOLD
+        // Questo garantisce che SC parta ESATTAMENTE da qui, non dal vecchio cue
+        osc.deckCueHold(d, true, d.cuePointSec); 
+        d.sentCueHoldToSC = true;
+    }
     d.playBtn.setPlaying(true);
   }
   return;

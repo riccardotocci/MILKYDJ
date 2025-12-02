@@ -1,14 +1,5 @@
 /**
- * OscBridge.pde (AGGIORNATO per gestione encoders)
- *
- * Bridge OSC Processing ⇄ SuperCollider per MILKY_DJ.
- * (Mantiene tutte le funzioni esistenti + aggiunge supporto ai canali encoder per la schermata mixer)
- *
- * Nuovi indirizzi gestiti:
- *   /dj3d/deck/encoders      (count canali per deck)
- *   /dj3d/deck/encoder       (nome singolo canale)
- *   /dj3d/deck/encoder_level (livello tempo reale, da /tr)
- *   /dj3d/deck/encoder/editor (richiesta apertura/chiusura editor encoder singolo)
+ * OscBridge.pde (AGGIORNATO per CUE Sync e Encoders)
  */
 
 import oscP5.*;
@@ -172,14 +163,33 @@ class OscBridge {
     char id = idOf(d); if (id == '?') return;
     send("/dj3d/deck/seek", String.valueOf(id), seconds);
   }
+  
+  // CUE HOLD standard
   void deckCueHold(Deck d, boolean on) {
     char id = idOf(d); if (id == '?') return;
     send("/dj3d/deck/cue_hold", String.valueOf(id), on);
   }
+
+  // --- NUOVO: CUE HOLD SINCRONIZZATO ---
+  void deckCueHold(Deck d, boolean on, float seconds) {
+    char id = idOf(d); if (id == '?') return;
+    // Invia anche il timestamp esatto per forzare il sync lato SuperCollider
+    send("/dj3d/deck/cue_hold", String.valueOf(id), on, seconds);
+  }
+
   void deckPlay(Deck d) {
     char id = idOf(d); if (id == '?') return;
-    send("/dj3d/deck/play", String.valueOf(id));
+    // Invia play con timestamp esplicito
+    send("/dj3d/deck/play", String.valueOf(id), d.playheadSec);
   }
+  // Aggiungi questo metodo in OscBridge.pde
+  void deckSetCueMonitor(Deck d, boolean on) {
+    char id = idOf(d);
+    if (id == '?') return;
+    // Invia il messaggio per attivare/disattivare il monitoraggio cuffie (PFL)
+    send("/dj3d/deck/cue_state", String.valueOf(id), on ? 1 : 0);
+  }
+  
   void deckPlayAt(Deck d, float seconds) {
     char id = idOf(d); if (id == '?') return;
     send("/dj3d/deck/play", String.valueOf(id), seconds);
@@ -278,10 +288,9 @@ class OscBridge {
       e.printStackTrace();
     }
   }
-
-  // ============================
-  // Callback RICEZIONE
-  // ============================
+  
+  // ... Resto del codice invariato (callback, helper analisi, etc.)
+  
   public void onHello(int langPort, int order, int numCh) {
     receivedHello = true;
     connected = true;
@@ -302,7 +311,6 @@ class OscBridge {
 
   public void onStemsLoaded(String deckId, String stemsDir, int count) {
     log("stems loaded deck=" + deckId + " count=" + count + " dir=" + stemsDir);
-    // Pre-inizializza i canali per robustezza (anche se /dj3d/deck/encoders non arriverà)
     initEncodersForDeck(deckId, Math.max(0, count));
   }
   public void onTrackLoaded(int idx, String filename, int numCh, int isPerc, String deckId) {
@@ -344,41 +352,29 @@ class OscBridge {
     log("deck volume FB " + deckId + " -> " + v);
   }
 
-  // === NUOVE CALLBACK ENCODER ===
-
-  // /dj3d/deck/encoders <deck> <count>
   public void onDeckEncodersCount(String deckId, int count) {
     log("encoders count deck=" + deckId + " -> " + count);
     initEncodersForDeck(deckId, Math.max(0, count));
   }
 
-  // /dj3d/deck/encoder <deck> <idx> <name>
   public void onDeckEncoderInfo(String deckId, int idx, String name) {
     ArrayList<EncoderChannelInfo> list = listForDeckId(deckId);
-    // Rende robusto: crea slot fino a idx incluso
     ensureEncoderListSize(list, idx + 1);
     list.get(idx).name = name;
-
-    if (app.frameCount % 60 == 0) { // log ogni ~1 sec
-      log("encoder info deck=" + deckId + " idx=" + idx + " name=" + name);
-    }
+    if (app.frameCount % 60 == 0) log("encoder info deck=" + deckId + " idx=" + idx + " name=" + name);
   }
 
-  // /dj3d/deck/encoder_level <deck> <idx> <amp>
   public void onDeckEncoderLevel(String deckId, int idx, float amp) {
     ArrayList<EncoderChannelInfo> list = listForDeckId(deckId);
-    // Anche qui: crea slot se servono
     ensureEncoderListSize(list, idx + 1);
     list.get(idx).level = amp;
   }
 
-  // Utility per liberare
   void clearEncoders() {
     encA.clear();
     encB.clear();
   }
 
-  // Getter usato dai pannelli Mixer
   EncoderChannelInfo[] getChannelsForDeck(String deckId) {
     if (deckId == null) return null;
     if (deckId.equalsIgnoreCase("A")) return encA.toArray(new EncoderChannelInfo[0]);
@@ -386,51 +382,41 @@ class OscBridge {
     return null;
   }
   
-void requestAnalyzeFolder(String stemsPath) {
+  void requestAnalyzeFolder(String stemsPath) {
     if (!connected) {
         app.println("[OSC][WARN] SC non connesso, skip analisi");
         return;
     }
-    
-    // Invia direttamente al server Python (porta 57121)
     NetAddress pythonAddr = new NetAddress("127.0.0.1", 57123);
     OscMessage msg = new OscMessage("/analyze_folder");
     msg.add(stemsPath);
-    
     try {
         osc.send(msg, pythonAddr);
         log("Richiesto analisi: " + stemsPath);
     } catch (Exception e) {
         app.println("[OSC][ERR] Invio /analyze_folder fallito: " + e);
     }
-}
+  }
 
-// Richiedi analisi di un singolo file
-void requestAnalyzeFile(String filePath) {
-    NetAddress pythonAddr = new NetAddress("127.0.0.1", 57122);
+  void requestAnalyzeFile(String filePath) {
+    NetAddress pythonAddr = new NetAddress("127.0.0.1", 57123);
     OscMessage msg = new OscMessage("/analyze_file");
     msg.add(filePath);
-    
     try {
         osc.send(msg, pythonAddr);
         log("Richiesto analisi file: " + filePath);
     } catch (Exception e) {
         app.println("[OSC][ERR] Invio /analyze_file fallito: " + e);
     }
-}
+  }
 
-  // ============================
-  // Stato connessione
-  // ============================
   boolean isConnected() { return connected && receivedHello; }
   void setDebug(boolean d) { debug = d; }
 }
 
-// Struttura info canale (UI bounds inclusi per hit-test)
 class EncoderChannelInfo {
   String name = "";
   float level = 0;
   boolean editorOpen = false;
-  // bounds pulsante editor
   float btnX, btnY, btnW, btnH;
 }

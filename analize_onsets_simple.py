@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analizzatore onset per DJ Ambisonics
+Analizzatore onset per DJ Ambisonics - Optimized for Apple Silicon (MPS)
 """
 
 from pythonosc.dispatcher import Dispatcher
@@ -10,6 +10,15 @@ import os
 import numpy as np
 from scipy.signal import butter, sosfilt
 import time
+import torch
+import torchaudio
+import torchaudio.functional as F
+import torchaudio.transforms as T
+
+# Configurazione Hardware
+# Verifica disponibilità MPS (Metal Performance Shaders) per M1/M2/M3/M4
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"🚀 Hardware Acceleration: {DEVICE}")
 
 # Configurazione OSC
 SC_HOST = "127.0.0.1"
@@ -20,184 +29,194 @@ LISTEN_PORT = 57123
 # Configurazione analisi audio
 VALID_EXTENSIONS = {".wav", ".wave", ".aif", ".aiff", ".mp3", ".flac", ".ogg", ".m4a"}
 HOP_LENGTH = 512
-CHUNK_SIZE = 128  # Per invio dati in chunk
+CHUNK_SIZE = 128
 
-# Client OSC per SuperCollider
 client = udp_client.SimpleUDPClient(SC_HOST, SC_PORT)
 
-def calculate_bpm(file_path):
-    """Calcola il BPM di un file audio."""
+def load_audio_torch(file_path):
+    """Carica audio direttamente in tensori PyTorch su GPU (MPS)."""
     try:
-        # Carica l'intero file audio
-        y, sr = librosa.load(file_path, sr=None, mono=True)
+        # Torchaudio carica (channels, frames)
+        waveform, sr = torchaudio.load(file_path)
         
-        if len(y) == 0:
-            return 0.0, "File audio vuoto", None, None, None
+        # Mix to mono se stereo: media dei canali
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+        # Sposta su MPS (GPU)
+        waveform = waveform.to(DEVICE)
+        return waveform, sr
+    except Exception as e:
+        print(f"Errore caricamento Torch: {e}")
+        return None, None
+
+def get_filter_coeffs_torch(sr, low_hz, high_hz=None, btype='low'):
+    """
+    Calcola coefficienti SOS su CPU (scipy) e li converte in tensori GPU.
+    Torchaudio.functional.sosfilt richiede coefficienti precisi.
+    """
+    nyquist = sr / 2
+    if btype == 'band':
+        low = max(low_hz / nyquist, 0.001)
+        high = min(high_hz / nyquist, 0.999)
+        sos = butter(4, [low, high], btype='band', output='sos')
+    else:
+        cutoff = min(low_hz / nyquist, 0.999)
+        sos = butter(4, cutoff, btype=btype, output='sos')
+    
+    # Converti in tensore MPS float32
+    return torch.from_numpy(sos).float().to(DEVICE)
+
+def calculate_bpm_hybrid(file_path, waveform_gpu, sr):
+    """Calcola BPM usando Librosa (CPU) ma partendo dai dati già caricati."""
+    try:
+        if waveform_gpu is None or waveform_gpu.shape[1] == 0:
+             return 0.0, "File vuoto", None
         
-        # Normalizza l'audio
-        if np.abs(y).max() > 0:
-            y = librosa.util.normalize(y)
+        # Per beat_track di Librosa serve Numpy su CPU
+        y_cpu = waveform_gpu.cpu().numpy().flatten()
         
-        # Calcola BPM usando librosa
+        # Normalizza
+        if np.abs(y_cpu).max() > 0:
+            y_cpu = librosa.util.normalize(y_cpu)
+            
         tempo, beat_frames = librosa.beat.beat_track(
-            y=y, 
+            y=y_cpu, 
             sr=sr, 
-            hop_length=HOP_LENGTH,
+            hop_length=HOP_LENGTH, 
             trim=False
         )
         
+        # --- FIX: Gestione compatibilità array/scalare per Librosa ---
+        if np.ndim(tempo) > 0:
+            tempo = tempo.item()  # Estrae il valore scalare dall'array
+            
         bpm = float(tempo) if np.isfinite(tempo) and tempo > 0 else 0.0
-        
-        if bpm > 0:
-            return bpm, f"BPM: {bpm:.1f}, beats: {len(beat_frames)}", y, sr, beat_frames
-        else:
-            return 0.0, "BPM non rilevabile", y, sr, None
+        return bpm, y_cpu, beat_frames
             
     except Exception as e:
-        return 0.0, f"Errore: {str(e)}", None, None, None
+        print(f"Errore BPM: {e}")
+        return 0.0, None, None
 
-def calculate_envelope_features(y, sr, onset_frames):
+def calculate_spectral_centroid_torch(waveform_filtered, sr, n_fft=2048, hop_length=512):
     """
-    Calcola le caratteristiche dell'envelope per ogni onset:
-    Approccio ottimizzato:
-    1. Converti in mono (già fatto)
-    2. Filtro passa-banda 50Hz - 8kHz (elimina sub e fruscio)
-    3. Rettifica (abs)
-    4. Liscia con low-pass a 15Hz
-    5. Calcola attacco e release
-    6. Calcola valore combinato con peso maggiore sulla release
-    7. Calcola frequenza spettrale media
+    Calcola il centroide spettrale interamente su GPU.
+    Molto più veloce di librosa.feature.spectral_centroid in loop.
+    """
+    # STFT su GPU
+    window = torch.hann_window(n_fft).to(DEVICE)
+    stft = torch.stft(waveform_filtered.squeeze(), n_fft=n_fft, hop_length=hop_length, 
+                      window=window, return_complex=True)
+    magnitude = torch.abs(stft) # (freq_bins, time_frames)
+    
+    # Frequenze per ogni bin
+    freqs = torch.linspace(0, sr/2, steps=n_fft//2 + 1, device=DEVICE).unsqueeze(1) # (freq_bins, 1)
+    
+    # Calcolo centroide vettorializzato: sum(freq * mag) / sum(mag)
+    mag_sum = torch.sum(magnitude, dim=0)
+    # Evita divisione per zero
+    mag_sum[mag_sum == 0] = 1e-8
+    
+    centroid = torch.sum(freqs * magnitude, dim=0) / mag_sum
+    return centroid # (time_frames,)
+
+def calculate_envelope_features_gpu(waveform, sr, onset_frames):
+    """
+    Approccio Ibrido Ottimizzato:
+    - Filtri (Butterworth): CPU (Scipy) -> Più stabile e compatibile.
+    - Analisi Spettrale (STFT): GPU (MPS) -> Accelerazione massiccia.
     """
     if len(onset_frames) == 0:
         return []
     
-    # Step 1: Filtro passa-banda (50Hz - 8kHz)
+    # --- FASE 1: FILTRAGGIO (CPU - Scipy) ---
+    # Spostiamo l'audio su CPU per il filtraggio rapido
+    # sosfilt di scipy è in C, quindi velocissimo anche su CPU M4
+    y_cpu = waveform.cpu().numpy().flatten()
+    
+    # 1. Filtro Passa-Banda (50Hz - 8kHz)
     nyquist = sr / 2
-    low_cutoff = 50.0 / nyquist
-    high_cutoff = 8000.0 / nyquist
+    low = max(50.0 / nyquist, 0.001)
+    high = min(8000.0 / nyquist, 0.999)
+    sos_band = butter(4, [low, high], btype='band', output='sos')
+    y_filtered_cpu = sosfilt(sos_band, y_cpu)
     
-    # Assicura che i cutoff siano validi (< 1.0)
-    low_cutoff = min(low_cutoff, 0.99)
-    high_cutoff = min(high_cutoff, 0.99)
-    
-    # Filtro passa-banda (Butterworth 4° ordine)
-    sos_band = butter(4, [low_cutoff, high_cutoff], btype='band', output='sos')
-    y_filtered = sosfilt(sos_band, y)
-    
-    # Step 2: Rettifica il segnale (valore assoluto)
-    y_rect = np.abs(y_filtered)
-    
-    # Step 3: Low-pass filter (Butterworth, cutoff a 15Hz per envelope lento)
-    cutoff = 15.0 / nyquist
-    sos = butter(4, cutoff, btype='low', output='sos')
-    envelope = sosfilt(sos, y_rect)
+    # 2. Envelope: Rettifica + Low Pass (15Hz)
+    y_rect = np.abs(y_filtered_cpu)
+    cutoff_env = min(15.0 / nyquist, 0.999)
+    sos_low = butter(4, cutoff_env, btype='low', output='sos')
+    envelope_cpu = sosfilt(sos_low, y_rect)
     
     # Normalizza envelope
-    if envelope.max() > 0:
-        envelope = envelope / envelope.max()
+    env_max = np.max(envelope_cpu)
+    if env_max > 0:
+        envelope_cpu = envelope_cpu / env_max
+
+    # --- FASE 2: ANALISI SPETTRALE (GPU - PyTorch MPS) ---
+    # Riportiamo solo l'audio filtrato su GPU per fare la STFT pesante
+    y_filtered_gpu = torch.from_numpy(y_filtered_cpu).float().to(DEVICE)
     
-    # Calcola STFT per analisi spettrale (sul segnale filtrato)
-    n_fft = 2048
-    hop_length = 512
-    S = np.abs(librosa.stft(y_filtered, n_fft=n_fft, hop_length=hop_length))
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    # Calcolo curva spettrale vettorializzato su GPU
+    # (Questa è la parte che guadagna di più dall'accelerazione)
+    spectral_curve = calculate_spectral_centroid_torch(y_filtered_gpu, sr, n_fft=2048, hop_length=512)
+    
+    # Riportiamo la curva spettrale su CPU per il campionamento
+    spectral_curve_cpu = spectral_curve.cpu().numpy()
     
     features = []
+    total_samples = len(envelope_cpu)
+    max_analysis_samples = int(0.5 * sr)
     
+    # --- FASE 3: ESTRAZIONE FEATURES (Logica procedurale veloce) ---
     for i, onset_sample in enumerate(onset_frames):
-        # Definisci la finestra di analisi (fino al prossimo onset o 500ms)
-        max_analysis_samples = int(0.5 * sr)  # 500ms
-        
+        # Definisci finestra temporale
         if i < len(onset_frames) - 1:
             next_onset = onset_frames[i + 1]
             window_end = min(onset_sample + max_analysis_samples, next_onset)
         else:
-            window_end = min(onset_sample + max_analysis_samples, len(envelope))
-        
-        if window_end <= onset_sample:
-            features.append({
-                'attack_time': 0.0,
-                'release_time': 0.0,
-                'velocity_value': 0.0,
-                'spectral_mean_freq': 0.0
-            })
-            continue
-        
-        # Estrai finestra envelope
-        env_window = envelope[onset_sample:window_end]
-        
-        # Step 5: Calcola frequenza spettrale media per questa finestra
-        # Converti onset_sample in frame STFT
-        onset_frame = int(onset_sample / hop_length)
-        window_end_frame = int(window_end / hop_length)
-        
-        if onset_frame >= S.shape[1]:
-            onset_frame = S.shape[1] - 1
-        if window_end_frame > S.shape[1]:
-            window_end_frame = S.shape[1]
-        
-        if window_end_frame <= onset_frame:
-            window_end_frame = onset_frame + 1
-        
-        # Estrai lo spettro nella finestra
-        spectrum_window = S[:, onset_frame:window_end_frame]
-        
-        # Calcola la media spettrale pesata (centroid per ogni frame, poi media)
-        if spectrum_window.shape[1] > 0:
-            spectral_centroids = []
-            for frame_idx in range(spectrum_window.shape[1]):
-                frame_spectrum = spectrum_window[:, frame_idx]
-                if frame_spectrum.sum() > 0:
-                    # Frequenza media pesata per ampiezza
-                    spectral_centroid = np.sum(freqs * frame_spectrum) / np.sum(frame_spectrum)
-                    spectral_centroids.append(spectral_centroid)
+            window_end = min(onset_sample + max_analysis_samples, total_samples)
             
-            if spectral_centroids:
-                spectral_mean_freq = np.mean(spectral_centroids)
-            else:
-                spectral_mean_freq = 0.0
-        else:
-            spectral_mean_freq = 0.0
+        if window_end <= onset_sample:
+            features.append({'attack_time': 0.0, 'release_time': 0.0, 'velocity_value': 0.0, 'spectral_mean_freq': 0.0})
+            continue
+
+        # Slicing su array NumPy (molto veloce)
+        env_window = envelope_cpu[onset_sample:window_end]
+        
+        # Recupero media spettrale dalla curva pre-calcolata
+        start_frame = int(onset_sample / 512)
+        end_frame = int(window_end / 512)
+        
+        # Bounds check
+        start_frame = min(start_frame, len(spectral_curve_cpu)-1)
+        end_frame = min(max(end_frame, start_frame + 1), len(spectral_curve_cpu))
+        
+        spec_slice = spectral_curve_cpu[start_frame:end_frame]
+        spectral_mean_freq = float(np.mean(spec_slice)) if len(spec_slice) > 0 else 0.0
         
         if len(env_window) < 2:
-            features.append({
-                'attack_time': 0.0,
-                'release_time': 0.0,
-                'velocity_value': 0.0,
-                'spectral_mean_freq': spectral_mean_freq
-            })
+            features.append({'attack_time': 0.0, 'release_time': 0.0, 'velocity_value': 0.0, 'spectral_mean_freq': spectral_mean_freq})
             continue
-        
-        # Step 3a: Calcola tempo di attacco (onset -> picco)
+
+        # Logica Attack/Release
         peak_idx = np.argmax(env_window)
-        attack_samples = peak_idx
-        attack_time = attack_samples / sr  # in secondi
+        attack_time = peak_idx / sr
         
-        # Step 3b: Calcola tempo di release (picco -> 50% del picco)
         peak_value = env_window[peak_idx]
         threshold = peak_value * 0.5
         
-        # Cerca il punto dove l'envelope scende sotto la soglia
-        release_samples = 0
-        for j in range(peak_idx, len(env_window)):
-            if env_window[j] < threshold:
-                release_samples = j - peak_idx
-                break
+        under_thresh = np.where(env_window[peak_idx:] < threshold)[0]
         
-        if release_samples == 0:  # Non ha raggiunto la soglia
+        if len(under_thresh) > 0:
+            release_samples = under_thresh[0]
+        else:
             release_samples = len(env_window) - peak_idx
+            
+        release_time = release_samples / sr
         
-        release_time = release_samples / sr  # in secondi
-        
-        # Step 4: Calcola valore combinato
-        # Normalizza attack e release in [0, 1] dove 0 = veloce, 1 = lento
-        # Attack veloce: < 10ms, lento: > 100ms
+        # Calcolo Velocity
         attack_norm = np.clip(attack_time / 0.1, 0.0, 1.0)
-        # Release veloce: < 50ms, lento: > 500ms
         release_norm = np.clip(release_time / 0.5, 0.0, 1.0)
-        
-        # Velocity value: 1.0 se entrambi veloci (percussivo), 0.0 se entrambi lenti (pad)
-        # Formula: 1.0 - weighted average con peso maggiore sulla release (70% release, 30% attack)
         velocity_value = 1.0 - (0.3 * attack_norm + 0.7 * release_norm)
         
         features.append({
@@ -206,353 +225,221 @@ def calculate_envelope_features(y, sr, onset_frames):
             'velocity_value': velocity_value,
             'spectral_mean_freq': spectral_mean_freq
         })
-    
-    print(f"[DEBUG] Features calcolate per {len(features)} onset")
+        
     return features
 
 def group_by_beat_position(onset_times, beat_frames, sr, features):
-    """
-    Raggruppa gli onset per posizione in beat.
-    Tutti gli onset nella stessa zona (stesso beat) hanno lo stesso valore.
-    """
+    """Raggruppa gli onset per posizione in beat (Logica CPU pura, invariata)."""
     if len(onset_times) == 0:
         return []
     
-    # Se non abbiamo beat_frames, crea dati senza raggruppamento beat
     if beat_frames is None or len(beat_frames) == 0:
         grouped_data = []
-        
-        # Calcola media mobile per le frequenze spettrali
-        window_size = 20
         spectral_freqs = [f['spectral_mean_freq'] for f in features]
-        
         for i, onset_time in enumerate(onset_times):
-            # Media mobile frequenze
-            start_idx = max(0, i - window_size + 1)
+            start_idx = max(0, i - 20 + 1)
             freq_window = spectral_freqs[start_idx:i+1]
             spectral_mean_freq_smoothed = np.mean(freq_window)
-            
             grouped_data.append({
-                'onset_time': onset_time,
-                'beat_index': 0,
-                'beat_position': onset_time,  # Usa il tempo come posizione
-                'beat_fraction': 0.0,
-                'attack_time': features[i]['attack_time'],
-                'release_time': features[i]['release_time'],
-                'velocity_value': features[i]['velocity_value'],
-                'velocity_value_grouped': features[i]['velocity_value'],
-                'spectral_mean_freq': features[i]['spectral_mean_freq'],
-                'spectral_mean_freq_smoothed': spectral_mean_freq_smoothed
+                'onset_time': onset_time, 'beat_index': 0, 'beat_position': onset_time, 'beat_fraction': 0.0,
+                'velocity_value_grouped': features[i]['velocity_value'], 'spectral_mean_freq_smoothed': spectral_mean_freq_smoothed,
+                **features[i]
             })
-        
         return grouped_data
     
-    # Converti beat_frames in tempi
     beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=HOP_LENGTH)
-    
-    # Calcola posizione in beat per ogni onset
     beat_start = beat_times[0] if len(beat_times) > 0 else 0.0
     beat_period = 60.0 / len(beat_times) * (beat_times[-1] - beat_start) if len(beat_times) > 1 else 1.0
     
     grouped_data = []
-    
     for i, onset_time in enumerate(onset_times):
-        # Calcola la posizione in beat
         beat_position = (onset_time - beat_start) / beat_period if beat_period > 0 else 0.0
-        
-        # Trova il beat più vicino (arrotonda)
         beat_index = int(round(beat_position))
-        
-        # Calcola la posizione frazionaria all'interno del beat (0.0 - 1.0)
         beat_fraction = beat_position - beat_index
-        
         grouped_data.append({
-            'onset_time': onset_time,
-            'beat_index': beat_index,
-            'beat_position': beat_position,
-            'beat_fraction': beat_fraction,
-            'attack_time': features[i]['attack_time'],
-            'release_time': features[i]['release_time'],
-            'velocity_value': features[i]['velocity_value'],
-            'spectral_mean_freq': features[i]['spectral_mean_freq']
+            'onset_time': onset_time, 'beat_index': beat_index, 'beat_position': beat_position, 'beat_fraction': beat_fraction,
+            **features[i]
         })
     
-    # Raggruppa per beat_index e calcola il valore medio per ogni gruppo
+    # Raggruppa e media
     beat_groups = {}
     for data in grouped_data:
-        beat_idx = data['beat_index']
-        if beat_idx not in beat_groups:
-            beat_groups[beat_idx] = []
-        beat_groups[beat_idx].append(data)
+        beat_groups.setdefault(data['beat_index'], []).append(data)
     
-    # Assegna lo stesso velocity_value a tutti gli onset nello stesso beat
     result = []
     for beat_idx, group in beat_groups.items():
-        # Usa il valore massimo del gruppo (il più percussivo)
         avg_velocity = np.mean([d['velocity_value'] for d in group])
-        
         for data in group:
             data['velocity_value_grouped'] = avg_velocity
             result.append(data)
-    
-    # Riordina per tempo
+            
     result.sort(key=lambda x: x['onset_time'])
     
-    # Calcola la media mobile delle frequenze spettrali (ultimi 20 valori)
-    window_size = 20
+    # Smoothing spettrale
     for i, data in enumerate(result):
-        start_idx = max(0, i - window_size + 1)
+        start_idx = max(0, i - 20 + 1)
         freq_window = [result[j]['spectral_mean_freq'] for j in range(start_idx, i + 1)]
         data['spectral_mean_freq_smoothed'] = np.mean(freq_window)
     
     return result
 
 def analyze_single_file(file_path):
-    """Analizza un singolo file: validazione + BPM + envelope features."""
+    """Orchestratore analisi ottimizzata."""
     filename = os.path.basename(file_path)
     
-    # Validazione file
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext not in VALID_EXTENSIONS or not os.path.isfile(file_path):
-        print(f"❌ File non valido: {filename}")
+    # 1. Caricamento su GPU (Veloce)
+    waveform_gpu, sr = load_audio_torch(file_path)
+    if waveform_gpu is None:
         return False, 0.0, []
+
+    # 2. Calcolo BPM (Richiede parziale ritorno a CPU per algoritmi complessi di librosa)
+    bpm, y_cpu, beat_frames = calculate_bpm_hybrid(file_path, waveform_gpu, sr)
     
-    # Step 2: Calcolo BPM e caricamento audio
-    bpm, bpm_msg, y, sr, beat_frames = calculate_bpm(file_path)
-    send_to_supercollider("/analysis/file_bpm", filename, bpm, bpm_msg)
+    send_to_supercollider("/analysis/file_bpm", filename, bpm, f"BPM: {bpm:.1f}")
     
-    if y is None or sr is None:
+    if y_cpu is None:
+        del waveform_gpu # Libera VRAM
+        torch.mps.empty_cache()
         return False, bpm, []
     
-    # Step 3: Detect onset
+    # 3. Onset Detect (CPU - Librosa è più accurato di semplici implementazioni torch)
     onset_frames = librosa.onset.onset_detect(
-        y=y,
-        sr=sr,
-        hop_length=HOP_LENGTH,
-        units='samples',
-        backtrack=True
+        y=y_cpu, sr=sr, hop_length=HOP_LENGTH, units='samples', backtrack=True
     )
     
     if len(onset_frames) == 0:
+        del waveform_gpu
         return True, bpm, []
     
     onset_times = onset_frames / sr
     
-    # Step 4: Calcola envelope features
-    features = calculate_envelope_features(y, sr, onset_frames)
+    # 4. Calcolo Features Envelope e Spettrali (GPU MASSIVE SPEEDUP)
+    # Passiamo il tensore GPU originale, non la copia numpy
+    features = calculate_envelope_features_gpu(waveform_gpu, sr, onset_frames)
     
-    # Step 5: Raggruppa per beat position
-    if beat_frames is not None and len(beat_frames) > 0:
-        grouped_data = group_by_beat_position(onset_times, beat_frames, sr, features)
-    else:
-        # Se non abbiamo beat, crea dati senza raggruppamento
-        grouped_data = []
-        for i, onset_time in enumerate(onset_times):
-            grouped_data.append({
-                'onset_time': onset_time,
-                'beat_index': 0,
-                'beat_position': 0.0,
-                'beat_fraction': 0.0,
-                'attack_time': features[i]['attack_time'],
-                'release_time': features[i]['release_time'],
-                'velocity_value': features[i]['velocity_value'],
-                'velocity_value_grouped': features[i]['velocity_value'],
-                'spectral_mean_freq': features[i]['spectral_mean_freq'],
-                'spectral_mean_freq_smoothed': features[i]['spectral_mean_freq']
-            })
+    # Pulizia memoria GPU immediata
+    del waveform_gpu
+    torch.mps.empty_cache()
     
-    # Step 6: Invia dati a SuperCollider
+    # 5. Raggruppamento (CPU leggera)
+    grouped_data = group_by_beat_position(onset_times, beat_frames, sr, features)
+    
+    # 6. Invio OSC
     send_envelope_data(filename, grouped_data)
     
     return True, bpm, grouped_data
 
 def send_envelope_data(filename, grouped_data):
-    """Invia i dati degli envelope a SuperCollider in chunk."""
+    """Invia i dati (invariato, solo ottimizzazioni python standard)."""
     if not grouped_data:
         send_to_supercollider("/analysis/onset_data", filename, 0, 0)
         return
     
-    # Prepara array per invio
     onset_times = [d['onset_time'] for d in grouped_data]
     beat_positions = [d['beat_position'] for d in grouped_data]
-    velocity_values = [d['velocity_value_grouped'] for d in grouped_data]
+    velocity_vals = [d['velocity_value_grouped'] for d in grouped_data]
     spectral_freqs = [d['spectral_mean_freq_smoothed'] for d in grouped_data]
     
-    # Applica media mobile agli ultimi 10 valori di velocity
-    window_size = 10
-    velocity_smoothed = []
-    for i in range(len(velocity_values)):
-        start_idx = max(0, i - window_size + 1)
-        window = velocity_values[start_idx:i+1]
-        velocity_smoothed.append(np.mean(window))
+    # Smoothing velocity (Python list comp veloce)
+    w_size = 10
+    vel_smooth = [np.mean(velocity_vals[max(0, i-w_size+1):i+1]) for i in range(len(velocity_vals))]
+    vel_exp = [v ** 10.0 for v in vel_smooth] # Exponent
     
-    # Applica mappatura esponenziale ai valori smoothed di velocity (strength)
-    # Enfatizza i valori alti, rende più soft i valori bassi
-    exponent = 10.0  # Controllo della curvatura esponenziale (10.0 = enfasi molto forte)
-    velocity_values_exp = [v ** exponent for v in velocity_smoothed]
-
+    # Onset Spread
     if len(grouped_data) > 0:
-        release_times = np.array([d.get('release_time', 0.0) for d in grouped_data], dtype=float)
-        rel_min = float(release_times.min())
-        rel_max = float(release_times.max())
-        if rel_max > rel_min:
-            onset_spread = ((release_times - rel_min) / (rel_max - rel_min)).tolist()
-        else:
-            onset_spread = [0.5] * len(grouped_data)
+        rels = np.array([d.get('release_time', 0.0) for d in grouped_data])
+        rmin, rmax = rels.min(), rels.max()
+        spread = ((rels - rmin) / (rmax - rmin)).tolist() if rmax > rmin else [0.5]*len(rels)
     else:
-        onset_spread = []
-    
-    # Controllo pause: se tra un onset e il successivo passano >2s o >8 beat,
-    # alza il valore dell'onset prima della pausa di 0.2 (dopo la mappatura exp, quindi non conta nella media)
-    for i in range(len(onset_times) - 1):
-        time_gap = onset_times[i + 1] - onset_times[i]
-        beat_gap = abs(beat_positions[i + 1] - beat_positions[i])
+        spread = []
         
-        if time_gap > 2.0 or beat_gap > 8.0:
-            # Boost del 0.2, ma non superare 1.0
-            velocity_values_exp[i] = min(velocity_values_exp[i] + 0.2, 1.0)
-    
-    # Invia in chunk - USA I NOMI CHE SUPERCOLLIDER SI ASPETTA
-    def send_array_chunked(path, data_array):
-        num_chunks = (len(data_array) + CHUNK_SIZE - 1) // CHUNK_SIZE
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * CHUNK_SIZE
-            end_idx = min(start_idx + CHUNK_SIZE, len(data_array))
-            chunk = data_array[start_idx:end_idx]
-            send_to_supercollider(path, filename, chunk_idx, len(chunk), *chunk)
-            time.sleep(0.001)  # Piccolo delay per evitare overflow buffer OSC
-    
-    send_array_chunked("/analysis/onset_times_chunk", onset_times)
-    send_array_chunked("/analysis/onset_pos_chunk", beat_positions)
-    send_array_chunked("/analysis/onset_strength_chunk", velocity_values_exp)  # Valori esponenziali
-    send_array_chunked("/analysis/onset_spread_chunk", onset_spread)
-    
-    # Normalizza le frequenze spettrali per contrast (0..1)
-    if len(spectral_freqs) > 0:
-        min_freq = min(spectral_freqs)
-        max_freq = max(spectral_freqs)
-        if max_freq > min_freq:
-            contrast_normalized = [(f - min_freq) / (max_freq - min_freq) for f in spectral_freqs]
-        else:
-            contrast_normalized = [0.5] * len(spectral_freqs)
+    # Gap boost
+    for i in range(len(onset_times) - 1):
+        if (onset_times[i+1] - onset_times[i] > 2.0) or (abs(beat_positions[i+1] - beat_positions[i]) > 8.0):
+            vel_exp[i] = min(vel_exp[i] + 0.2, 1.0)
+            
+    # Contrast Normalization
+    if spectral_freqs:
+        smin, smax = min(spectral_freqs), max(spectral_freqs)
+        contrast = [(f - smin)/(smax - smin) for f in spectral_freqs] if smax > smin else [0.5]*len(spectral_freqs)
     else:
-        contrast_normalized = []
-    
-    send_array_chunked("/analysis/onset_contrast_chunk", contrast_normalized)
+        contrast = []
+
+    # Helper per chunk
+    def send_chunk(path, arr):
+        n_chunks = (len(arr) + CHUNK_SIZE - 1) // CHUNK_SIZE
+        for i in range(n_chunks):
+            chunk = arr[i*CHUNK_SIZE : (i+1)*CHUNK_SIZE]
+            send_to_supercollider(path, filename, i, len(chunk), *chunk)
+            time.sleep(0.0005) # Delay ridotto dato che M4 elabora più in fretta
+            
+    send_chunk("/analysis/onset_times_chunk", onset_times)
+    send_chunk("/analysis/onset_pos_chunk", beat_positions)
+    send_chunk("/analysis/onset_strength_chunk", vel_exp)
+    send_chunk("/analysis/onset_spread_chunk", spread)
+    send_chunk("/analysis/onset_contrast_chunk", contrast)
     
     print(f"✓ {len(grouped_data)} onset inviati")
 
-def send_to_supercollider(message_path, *args):
-    """Invia un messaggio OSC a SuperCollider."""
+def send_to_supercollider(addr, *args):
     try:
-        # Converte SEMPRE la tuple *args in lista
-        client.send_message(message_path, list(args))
+        client.send_message(addr, list(args))
     except Exception as e:
-        print(f"❌ Errore invio {message_path}: {e}")
+        print(f"❌ OSC Error: {e}")
 
-def handle_test_message(addr, *args):
-    """Handler per messaggi di test."""
-    print(f"Test ricevuto: {args}")
-    send_to_supercollider("/test/response", "received", len(args))
-
+# --- Handlers OSC (Struttura invariata) ---
 def handle_analyze_folder(addr, *args):
-    """Handler OSC che riceve richieste di analisi cartella."""
-    if len(args) < 1:
-        print("❌ Manca il path della cartella")
-        send_to_supercollider("/analysis/error", "Manca il path della cartella")
-        return
+    if not args: return
+    folder = args[0]
+    if not os.path.isdir(folder): return
     
-    folder_path = args[0]
-    print(f"\n📁 Analisi cartella: {folder_path}")
+    files = [os.path.join(folder, f) for f in sorted(os.listdir(folder)) 
+             if os.path.splitext(f)[1].lower() in VALID_EXTENSIONS]
     
-    # Verifica che sia una cartella
-    if not os.path.isdir(folder_path):
-        print(f"❌ Path non è una cartella valida")
-        send_to_supercollider("/analysis/error", f"Path non valido: {folder_path}")
-        return
+    if not files: return
     
-    # Trova tutti i file audio
-    audio_files = []
-    for filename in sorted(os.listdir(folder_path)):
-        ext = os.path.splitext(filename)[1].lower()
-        if ext in VALID_EXTENSIONS:
-            audio_files.append(os.path.join(folder_path, filename))
-    
-    if not audio_files:
-        print(f"❌ Nessun file audio trovato")
-        send_to_supercollider("/analysis/error", "Nessun file audio trovato")
-        return
-    
-    print(f"📊 {len(audio_files)} file da analizzare")
-    
-    # Inizio analisi batch
-    send_to_supercollider("/analysis/start", len(audio_files), folder_path)
-    
+    send_to_supercollider("/analysis/start", len(files), folder)
     valid_bpms = []
     
-    # Analizza ogni file
-    for i, file_path in enumerate(audio_files):
-        filename = os.path.basename(file_path)
-        
-        send_to_supercollider("/analysis/file_start", filename, i+1, len(audio_files))
-        
-        # Analisi del file
-        is_valid, bpm, grouped_data = analyze_single_file(file_path)
-        
-        if is_valid and bpm > 0:
-            valid_bpms.append(bpm)
-        
-        send_to_supercollider("/analysis/file_end", filename)
+    print(f"🔥 Starting Batch Analysis on MPS Device: {DEVICE}")
     
-    # Calcola BPM globale se abbiamo BPM validi
-    if valid_bpms:
-        global_bpm = np.median(valid_bpms)
-        print(f"✓ BPM globale: {global_bpm:.1f}")
-    else:
-        global_bpm = 0.0
-    
-    # Fine analisi
-    send_to_supercollider("/analysis/global_bpm", global_bpm, len(valid_bpms))
-    send_to_supercollider("/analysis/end", len(audio_files), len(valid_bpms))
-    
-    print(f"✓ Analisi completata\n")
+    for i, fpath in enumerate(files):
+        fname = os.path.basename(fpath)
+        send_to_supercollider("/analysis/file_start", fname, i+1, len(files))
+        
+        # Qui si potrebbe parallelizzare ulteriormente, ma con GPU è meglio sequenziale 
+        # per non saturare la VRAM se i file sono lunghi.
+        ok, bpm, _ = analyze_single_file(fpath)
+        
+        if ok and bpm > 0: valid_bpms.append(bpm)
+        send_to_supercollider("/analysis/file_end", fname)
+        
+    gbpm = np.median(valid_bpms) if valid_bpms else 0.0
+    print(f"✓ Global BPM: {gbpm:.1f}")
+    send_to_supercollider("/analysis/global_bpm", gbpm, len(valid_bpms))
+    send_to_supercollider("/analysis/end", len(files), len(valid_bpms))
 
 def handle_analyze_file(addr, *args):
-    """Handler OSC per analizzare un singolo file."""
-    if len(args) < 1:
-        print("❌ Manca il path del file")
-        send_to_supercollider("/analysis/error", "Manca il path del file")
-        return
-    
-    file_path = args[0]
-    filename = os.path.basename(file_path)
-    
-    send_to_supercollider("/analysis/file_start", filename, 1, 1)
-    
-    is_valid, bpm, grouped_data = analyze_single_file(file_path)
-    
-    send_to_supercollider("/analysis/file_end", filename)
-    send_to_supercollider("/analysis/end", 1, 1 if is_valid else 0)
+    if not args: return
+    fpath = args[0]
+    fname = os.path.basename(fpath)
+    send_to_supercollider("/analysis/file_start", fname, 1, 1)
+    ok, _, _ = analyze_single_file(fpath)
+    send_to_supercollider("/analysis/file_end", fname)
+    send_to_supercollider("/analysis/end", 1, 1 if ok else 0)
 
 def main():
-    """Funzione principale - avvia il server OSC."""
-    print(f"🎵 Server OSC: {LISTEN_HOST}:{LISTEN_PORT}")
-    print(f"📡 Target SC: {SC_HOST}:{SC_PORT}")
-    
-    # Configura dispatcher OSC
     dispatcher = Dispatcher()
     dispatcher.map("/analyze_folder", handle_analyze_folder)
     dispatcher.map("/analyze_file", handle_analyze_file)
-    dispatcher.map("/test", handle_test_message)
     
-    # Avvia server
     server = osc_server.ThreadingOSCUDPServer((LISTEN_HOST, LISTEN_PORT), dispatcher)
-    print("✓ Server pronto\n")
-    
+    print(f"🎵 M4 Optimized Server: {LISTEN_HOST}:{LISTEN_PORT} -> SC: {SC_PORT}")
+    print(f"⚡ Using PyTorch Device: {DEVICE}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n✓ Server fermato")
+        pass
 
 if __name__ == "__main__":
     main()

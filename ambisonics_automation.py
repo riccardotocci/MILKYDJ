@@ -65,6 +65,7 @@ import warnings
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 warnings.filterwarnings('ignore')
 
@@ -196,7 +197,16 @@ def separate_4stems(input_file: str, force=False, device=None) -> dict:
     log.info("Eseguo Demucs:")
     log.info(" ".join(f'"{c}"' if " " in c else c for c in cmd))
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # --- MODIFICA FONDAMENTALE ---
+    # 1. Copia l'ambiente attuale del sistema
+    env_vars = os.environ.copy()
+    # 2. Forza la variabile per PyTorch 2.5+ su Mac
+    env_vars["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    
+    # 3. Passa 'env=env_vars' al comando subprocess
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env_vars)
+    # -----------------------------
+
     if result.returncode != 0:
         log.error(result.stderr.strip())
         raise RuntimeError("Demucs fallito")

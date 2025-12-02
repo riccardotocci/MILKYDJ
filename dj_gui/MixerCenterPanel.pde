@@ -449,14 +449,18 @@ class MixerCenterPanel {
     phonesKnob.mouseReleased(mx, my);
 
     // Toggle CUE A
-    if (btnCueA.pressed && btnCueA.contains(mx, my)) {
+if (btnCueA.pressed && btnCueA.contains(mx, my)) {
       cueAOn = !cueAOn;
+      // Invia comando a SuperCollider
+      if (osc != null) osc.deckSetCueMonitor(deckA, cueAOn);
     }
     btnCueA.mouseReleased(mx, my);
 
     // Toggle CUE B
     if (btnCueB.pressed && btnCueB.contains(mx, my)) {
       cueBOn = !cueBOn;
+      // Invia comando a SuperCollider
+      if (osc != null) osc.deckSetCueMonitor(deckB, cueBOn);
     }
     btnCueB.mouseReleased(mx, my);
 

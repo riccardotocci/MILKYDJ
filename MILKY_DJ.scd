@@ -26,11 +26,16 @@ ServerOptions.outDevices;   // o: ServerOptions.devices;
 
 // imposta solo l'output
 Server.default.options.outDevice_("Altoparlanti MacBook Pro");
-Server.default.options.outDevice_("IT663x1");
-Server.default.options.numOutputBusChannels = 8;  // quante uscite fisiche userai
+Server.default.options.outDevice_("Scarlett 18i20 4th Gen");
+
+Server.default.options.numOutputBusChannels = 10;  // quante uscite fisiche userai
 // (alcune build richiedono anche:)
-Server.default.options.numOutputChannels = 8;
+Server.default.options.numOutputChannels = 10;
+s.options.numOutputBusChannels
+
 (
+
+
 // ================== SETTINGS ==================
 ~order = 3;
 ~numChannels = ((~order + 1) ** 2).asInteger;   // 3rd order -> 16 channels
@@ -41,7 +46,8 @@ Server.default.options.numOutputChannels = 8;
     reverb: "FdnReverb"
 );
 ~orderOut = 3;
-~outChannels = 8;  // numero di canali di uscita desiderati per il simpleDecoder
+~outChannels = 6;  // numero di canali di uscita desiderati per il simpleDecoder
+
 
 // IEM StereoEncoder params: azimuth=6, elevation=7
 ~encoderAzParam = 6;
@@ -61,7 +67,7 @@ Server.default.options.numOutputChannels = 8;
 ~scOscInPort = NetAddr.langPort;
 
 // Uscite cuffie (hw out index). Se usi interfacce multi-out, imposta p.es. 2 per usare out 2-3
-~phonesOut = 10;  // canale di partenza (stereo -> out, out+1)
+~phonesOut = 6;  // canale di partenza (stereo -> out, out+1)
 
 // Cartella di default (non usata nel nuovo load, lasciata per compatibilità)
 ~defaultFolder = "";
@@ -116,58 +122,66 @@ Server.default.options.numOutputChannels = 8;
 };
 
 // Ricostruisce la timeline completa quando tutti i chunk del file sono arrivati
+// ================== FINALIZZAZIONE ANALISI ==================
 ~finalizeFile = { |name|
     var e = ~files[name];
     var ch, n;
 
-    if(e.isNil) {
-        ("[SC][WARN] finalize: missing entry for '%'".format(name)).postln;
-        ^nil;
-    };
-
+    if(e.isNil) { ("[SC][WARN] finalize: missing entry for '%'; skip".format(name)).postln; ^nil };
     ch = e[\chunks];
 
+    // 1. Ricostruzione array dai chunk (Logica robusta di ambisonics_onset.scd)
     e[\onsetTimes]    = ~rebuildArrayFromChunks.(ch[\times]);
     e[\onsetPos]      = ~rebuildArrayFromChunks.(ch[\pos]);
     e[\onsetFlux]     = ~rebuildArrayFromChunks.(ch[\flux]);
     e[\onsetContrast] = ~rebuildArrayFromChunks.(ch[\contrast]);
 
-    n = [
-        e[\onsetTimes].size,
-        e[\onsetPos].size,
-        e[\onsetFlux].size,
-        e[\onsetContrast].size
-    ].minItem;
+    // Trova la dimensione minima comune per evitare crash sugli indici
+    n = [ e[\onsetTimes].size, e[\onsetPos].size, e[\onsetFlux].size, e[\onsetContrast].size ].minItem;
 
-    if(n <= 0) {
+    if(n.isNil or: { n <= 0 }) {
         ("[SC][WARN] empty timeline for '%'".format(name)).postln;
-        ^nil;
+        ^nil
     };
 
+    // Taglia gli array alla dimensione minima
     e[\onsetTimes]    = e[\onsetTimes].copyRange(0, n-1);
     e[\onsetPos]      = e[\onsetPos].copyRange(0, n-1);
     e[\onsetFlux]     = e[\onsetFlux].copyRange(0, n-1);
     e[\onsetContrast] = e[\onsetContrast].copyRange(0, n-1);
 
+    // Crea la timeline strutturata
     e[\timeline] = Array.fill(n, { |i|
-        (
-            time:     e[\onsetTimes][i],
-            beat:     e[\onsetPos][i],
-            flux:     e[\onsetFlux][i],
-            contrast: e[\onsetContrast][i]
-        )
+        ( time: e[\onsetTimes][i],
+          beat: e[\onsetPos][i],
+          flux: e[\onsetFlux][i],
+          contrast: e[\onsetContrast][i] )
     });
 
     e[\finalized] = true;
     ~files[name] = e;
-
     ~filesFinalizedCount = ~filesFinalizedCount + 1;
 
-    ("[SC] Finalized file '%': N=% | BPM=%"
-        .format(name, n, (e[\bpm] ? "nil"))).postln;
+    ("[SC] Finalized file '%': N=% | BPM=%".format(name, n, (e[\bpm] ? "nil"))).postln;
 
-    // stampa qualche evento per debug
-    e[\timeline].copyRange(0, (n-1).clip(0, 7)).do(_.postln);
+    // ==============================================================================
+    // MODIFICA CRUCIALE PER DJING (NON PRESENTE IN AMBISONICS_ONSET.SCD)
+    // ==============================================================================
+    // Controlla se la traccia è caricata in un deck che sta GIÀ suonando.
+    // In tal caso, avvia l'automazione immediatamente.
+    ~tracks.do { |t|
+        if(PathName(t[\path]).fileName == name) {
+             var deckId = t[\deck]; // Es: 'A' o 'B'
+             if(deckId.notNil) {
+                 var d = ~decks[deckId];
+                 // Se il deck è in play, avvia automazione ora
+                 if(d.notNil and: { d[\playing] }) {
+                     "[SC] Deck in play. Avvio automazione immediata per stem: %".format(name).postln;
+                     ~startAutomationFor.(name);
+                 };
+             };
+        }
+    };
 };
 
 // ================== GLOBALS ==================
@@ -216,12 +230,13 @@ SynthDef(\binauralDecoder, { | bus, out = 0 |
 }).add;
 
 // Sostituisci il simpleDecoder con questa versione
+// Sostituisci la vecchia SynthDef(\simpleDecoder...) con questa:
 SynthDef(\simpleDecoder, { | bus, out = 0 |
-    var n     = ~numChannels;              // HOA in ingresso
-    var outs  = ~outChannels.asInteger;    // numero uscite fisiche (costante al build)
-    var inS   = In.ar(bus, n);
-    var dec   = VSTPlugin.ar(inS, outs);   // QUI outs è un intero, NON un Control
-    Out.ar(out, dec);
+    var n = ~numChannels;          // 16 canali in ingresso (Ambisonics)
+    var outs = ~outChannels.asInteger; // 8 canali in uscita
+
+    // SimpleDecoder: HOA input -> 8 canali output diretti
+    Out.ar(out, VSTPlugin.ar(In.ar(bus, n), outs));
 }).add;
 
 SynthDef(\stereoEncoder, { | bus = 0 |
@@ -255,6 +270,11 @@ SynthDef(\monoPlayer, { | out=0, buf=0, rate=1, amp=1, trig=0, startPos=0 |
 SynthDef(\cuePlayer, { | out=0, buf=0, rate=1, amp=1, trig=0, startPos=0 |
     var sig = PlayBuf.ar(2, buf, BufRateScale.kr(buf) * rate, trig, startPos, loop: 1);
     Out.ar(out, sig * amp);
+}).add;
+
+SynthDef(\cuePlayerMono, { | out=0, buf=0, rate=1, amp=1, trig=0, startPos=0 |
+    var sig = PlayBuf.ar(1, buf, BufRateScale.kr(buf) * rate, trig, startPos, loop: 1);
+    Out.ar(out, sig.dup * amp);
 }).add;
 
 // Azimuth LFO (output 0..1)
@@ -294,17 +314,23 @@ s.waitForBoot({
     ~ambiMasterGroup = Group.head(s);
     ~decoder !? { ~decoder.free };
 
-    if(~decoderType == \simple) {
+    // --- CORREZIONE QUI ---
+    // Controlliamo sia '\simple' che '\simpleDecoder' per sicurezza
+    if(~decoderType == \simpleDecoder or: { ~decoderType == \simple }) {
         synthName  = \simpleDecoder;
         pluginName = ~pluginNames[\simpleDecoder];
-        outCh      = ~outChannels.max(8);
+        // Usa esattamente i canali che hai chiesto, senza forzarli a 8
+        outCh      = ~outChannels.asInteger;
     } {
+        // Fallback su Binaural
         synthName  = \binauralDecoder;
         pluginName = ~pluginNames[\binauralDecoder];
-        outCh      = 8;
+        outCh      = 2; // Binaural è solitamente stereo (2), ma VSTPlugin.ar ne può gestire di più.
     };
 
-    // NOTA: niente \outCh qui
+    // NOTA: Il numero di canali reali è "cotto" dentro la SynthDef \simpleDecoder
+    // quando viene compilata (vedi punto 3 sotto), quindi outCh qui serve solo per log/debug.
+
     ~decoder = VSTPluginController(
         Synth(synthName, [\bus, ~ambiMasterBus, \out, 0],
             target: ~ambiMasterGroup, addAction: \addToTail)
@@ -319,14 +345,22 @@ s.waitForBoot({
 };
 
 ~switchDecoder = { |newType|
-    var target = newType.asString.toLower.asSymbol;
-    if(target != \simple and: { target != \binaural }) {
-        "[SC] Unknown decoder type: %".format(target).warn; ^nil;
+    var target = newType.asString.asSymbol; // Rimuovi .toLower per mantenere CamelCase se serve
+
+    // Mappa "simple" -> "simpleDecoder" per comodità
+    if(target == \simple) { target = \simpleDecoder };
+    if(target == \binaural) { target = \binauralDecoder };
+
+    if(target != \simpleDecoder and: { target != \binauralDecoder }) {
+        "[SC] Unknown decoder type: %".format(target).warn;
+        ^nil;
     };
+
     if(target == ~decoderType) {
         ("[SC] Decoder già attivo (%), nessuno switch.".format(target)).postln;
         ^nil;
     };
+
     ("[SC] Switching decoder: % -> %".format(~decoderType, target)).postln;
     ~decoderType = target;
     ~setupAmbiMaster.();
@@ -858,20 +892,28 @@ toRemove.do { |t|
 
 // Nuovo: prepara il player cuffie senza avviare la riproduzione
 ~deckCuePrepare = { |id, buf|
-    var d;
-    d = ~decks[id]; if(d.isNil) { ^nil };
+    var d, synthName;
+    d = ~decks[id];
+    if(d.isNil) { ^nil };
+
+    // Scegli synth mono o stereo in base ai canali del buffer
+    synthName = (buf.numChannels == 1).if({ \cuePlayerMono }, { \cuePlayer });
+
     d[\cuePlayer].notNil.if { d[\cuePlayer].free };
-    d[\cuePlayer] = Synth.head(d[\cueGroup], \cuePlayer, [
+    d[\cuePlayer] = Synth.head(d[\cueGroup], synthName, [
         \out, d[\cueOut], \buf, buf, \rate, 1, \amp, 0, \trig, 0, \startPos, 0
     ]);
     ~processing.sendMsg('/dj3d/deck/cue_state', id.asString, 0);
 };
 
 ~deckCuePlay = { |id, buf|
-    var d;
+    var d, synthName;
     d = ~decks[id]; if(d.isNil) { ^nil };
+
+    synthName = (buf.numChannels == 1).if({ \cuePlayerMono }, { \cuePlayer });
+
     d[\cuePlayer].notNil.if { d[\cuePlayer].free };
-    d[\cuePlayer] = Synth.head(d[\cueGroup], \cuePlayer, [
+    d[\cuePlayer] = Synth.head(d[\cueGroup], synthName, [
         \out, d[\cueOut], \buf, buf, \rate, 1, \amp, d[\cueVol].clip(0, 1), \trig, 1, \startPos, 0
     ]);
     ~processing.sendMsg('/dj3d/deck/cue_state', id.asString, 1);
@@ -900,35 +942,47 @@ toRemove.do { |t|
 
 // Carica stems per un deck dato un "file" principale; NON avvia più il CUE
 ~deckLoadFile = { |id, filePath|
-    var d, p, parentDir, baseNoExt, stemsDir, newStems, minFrames;
+    var d, p, parentDir, baseNoExt, stemsDir, newStems, minFrames, sf, numCh;
 
     d = ~decks[id];
     if(d.isNil) {
         "[SC][ERR] Deck % non esiste".format(id).warn;
         ^nil;
     };
-
     if(File.exists(filePath).not) {
         "[SC][ERR] File non trovato: %".format(filePath).warn;
         ~processing.sendMsg('/dj3d/deck/error', id.asString, "file_not_found", filePath.asString);
         ^nil;
     };
-
     p = PathName(filePath);
     parentDir = p.pathOnly;
     baseNoExt = p.fileNameWithoutExtension;
 
-    // 1) CUE: carica buffer e PREPARA (non suona)
+    // 1) CUE: Controllo canali e caricamento buffer corretto
     ~deckCueStop.(id);
-    Buffer.readChannel(s, p.fullPath, channels: [0,1], action: { |b|
+
+    // Apri il file per controllare se è mono o stereo
+    sf = SoundFile.openRead(p.fullPath);
+    if(sf.notNil) {
+        numCh = sf.numChannels;
+        sf.close;
+    } {
+        numCh = 2; // Fallback se non riesce a leggere l'header
+    };
+
+    Buffer.readChannel(s, p.fullPath,
+        // Se mono leggi ch 0, se stereo leggi 0 e 1.
+        channels: (numCh == 1).if({[0]}, {[0,1]}),
+        action: { |b|
         {
             d[\cueBuf] = b;
-            ~deckCuePrepare.(id, b); // <-- niente autoplay
+            ~deckCuePrepare.(id, b);
             ~processing.sendMsg('/dj3d/deck/cue_loaded', id.asString, p.fullPath);
+            ("[SC] CUE Buffer loaded: % chan, SR: %".format(b.numChannels, b.sampleRate)).postln;
         }.defer;
     });
 
-    // 2) STEMS: <parent>/stems/<basenameNoExt>
+    // 2) STEMS: caricamento standard...
     stemsDir = parentDir +/+ "stems" +/+ baseNoExt;
     if(File.exists(stemsDir).not) {
         "[SC][ERR] Stems folder non trovata: %".format(stemsDir).warn;
@@ -936,28 +990,19 @@ toRemove.do { |t|
         ^nil;
     };
 
-    // libera stems precedenti del deck
     ~deckClearStems.(id);
-
-    // carica stems nel deck
     newStems = ~loadStemsFolderToDeck.(stemsDir, id);
 
-	~processing.sendMsg('/dj3d/deck/encoders', id.asString, newStems.size);
+    ~processing.sendMsg('/dj3d/deck/encoders', id.asString, newStems.size);
 
-    // CALCOLA trigID PRIMA di inviare i messaggi
     newStems.do { |t, i|
         var tid;
         t[\deckIdx] = i;
-
-        // Calcola trigID per distinguere deck A (0..99) / B (100..199)
         tid = (id == 'B').if({ 100 + i }, { i });
-        t[\meterTid] = tid;  // <-- SALVA qui, prima del buffer action
-
-        // Invia nome encoder (basename del file)
+        t[\meterTid] = tid;
         ~processing.sendMsg('/dj3d/deck/encoder', id.asString, i, PathName(t[\path]).fileName);
     };
 
-    // init transport defaults for this deck
     d[\bpmRef]    = ~deckComputeRefBPM.(id);
     d[\bpmTarget] = d[\bpmRef];
     d[\rate]      = 1.0;
@@ -1047,13 +1092,22 @@ toRemove.do { |t|
 };
 
 // Momentary CUE: while on -> play from cue; on release -> stop and reset to cue
-~deckCueHold = { |id, state|
+~deckCueHold = { |id, state, secOrNil|
     var d;
     d = ~decks[id]; if(d.isNil) { ^nil };
+
     if(state.asBoolean) {
+        // HOLD ON: Play
+
+        // Se fornito un timestamp esplicito, aggiorna la posizione CUE e usa QUELLA per partire
+        if(secOrNil.notNil) {
+             var sr = ~deckSampleRate.(id);
+             d[\cuePosSam] = (secOrNil.clip(0, 1e9) * sr).asInteger;
+        };
+
         ~deckStartFrom.(id, d[\cuePosSam]);
     }{
-        // stop and hard-reset to cue (silent)
+        // HOLD OFF: Stop and reset to cue (silent)
         ~deckStop.(id);
         ~deckRetriggerAll.(id, d[\cuePosSam]); // re-arm at cue point (muted)
     };
@@ -1196,10 +1250,12 @@ OSCdef(\dj3d_deck_stop, { |msg|
 OSCdef(\dj3d_deck_cue_hold, { |msg|
     var id = msg[1].asString.asSymbol;
     var st = msg[2].asInteger;
-    "OSC: /dj3d/deck/cue_hold % -> %".format(id, st).postln;
-    ~deckCueHold.(id, st);
-}, '/dj3d/deck/cue_hold');
+    var sec = (msg.size > 3).if({ msg[3].asFloat }, { nil }); // Legge timestamp se presente
 
+    "OSC: /dj3d/deck/cue_hold % -> % (sec: %)".format(id, st, sec).postln;
+    ~deckCueHold.(id, st, sec);
+}, '/dj3d/deck/cue_hold');
+∫
 OSCdef(\dj3d_deck_set_cue, { |msg|
     var id = msg[1].asString.asSymbol;
     var sec = msg[2].asFloat;
@@ -1366,6 +1422,9 @@ OSCdef(\dj3d_deck_cue_hold, { |msg|
 // Play con parametro opzionale (secondi)
 // /dj3d/deck/play A            -> vecchio comportamento (usa cuePosSam o loopIn)
 // /dj3d/deck/play A 37.52      -> forza start da 37.52s (aggiorna cue interno)
+// Play con parametro opzionale (secondi)
+// /dj3d/deck/play A            -> vecchio comportamento (usa cuePosSam o loopIn)
+// /dj3d/deck/play A 37.52      -> forza start da 37.52s (aggiorna cue interno)
 OSCdef(\dj3d_deck_play, { |msg|
     var id = msg[1].asString.asSymbol;
     var d = ~decks[id];
@@ -1391,10 +1450,16 @@ OSCdef(\dj3d_deck_play, { |msg|
 
         d[\cuePosSam] = startSam;
         "OSC: /dj3d/deck/play % (from %.3f s)".format(id, sec).postln;
+
+        // 1. Avvia audio
         ~deckStartFrom.(id, startSam);
+
+        // 2. AVVIA AUTOMAZIONI (Mancava questa riga!)
+        ~deckStartAllRoutines.(id);
+
     }{
         "OSC: /dj3d/deck/play % (cue default)".format(id).postln;
-        ~deckPlay.(id);
+        ~deckPlay.(id); // Questo chiamava già startAllRoutines internamente
     };
 }, '/dj3d/deck/play');
 
@@ -1464,10 +1529,9 @@ OSCdef(\dj3d_deck_encoder_editor, { |msg|
 
 // /analysis/start n_files
 OSCdef(\anaStart, { |msg|
-    ~files.clear;
     ~expectedFiles = msg[1].asInteger;
     ~filesFinalizedCount = 0;
-    ("[SC] /analysis/start | expected files = %".format(~expectedFiles)).postln;
+    ("[SC] /analysis/start | expected files = " ++ ~expectedFiles).postln;
 }, '/analysis/start');
 
 // /analysis/file_start name
@@ -1491,11 +1555,11 @@ OSCdef(\fileBPM, { |msg|
     var name = msg[1].asString;
     var idx  = msg[2].asInteger;
     var cnt  = msg[3].asInteger;
-    var vals = msg.copyToEnd(4).keep(cnt);
+    var vals = msg.copyToEnd(4).keep(cnt); // Copia i valori dal messaggio
     ~ensureFileEntry.(name);
     ~files[name][\chunks][keySym][idx] = vals;
-    ("[SC] % | % | idx=% count=%"
-        .format(msg[0], name, idx, cnt)).postln;
+    // Debug opzionale (commentato per pulizia)
+    // ("[SC] Chunk " ++ keySym ++ " | " ++ name ++ " | idx=" ++ idx).postln;
 };
 
 // chunk stream

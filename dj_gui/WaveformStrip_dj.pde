@@ -79,6 +79,12 @@ class WaveformStrip {
   // Draw entry point
   // ------------------------------
   void draw() {
+    if (!deck.showWaveform) {
+    fill(120); textAlign(CENTER, CENTER); textSize(14);
+    text("Waveform OFF", x + w/2f, y + h/2f);
+    textSize(14);
+    return;
+}
     noStroke();
     fill(24);
     rect(x, y, w, h, 8);

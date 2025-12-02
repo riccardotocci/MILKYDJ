@@ -135,6 +135,9 @@ void draw() {
   lastMillis = now;
 
   background(20);
+  
+  deckA.updateTransport(dt);
+  deckB.updateTransport(dt);
 
   float navH = 50;
   drawNavBar(navH);
@@ -223,9 +226,6 @@ void drawNavBar(float navH) {
 void drawMainScreen(float x, float y, float w, float h, float dt) {
   float pad = 16;
   float gapWave = 6;
-
-  deckA.updateTransport(dt);
-  deckB.updateTransport(dt);
 
   // Waveforms
   float waveH = constrain(h * 0.14, 30, 72);

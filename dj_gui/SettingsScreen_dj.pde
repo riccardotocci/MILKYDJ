@@ -10,6 +10,7 @@ class SettingsScreen {
   // Editor toggle per ciascun decoder
   ToggleButton btnEditBinaural = new ToggleButton("Editor Binaural", false);
   ToggleButton btnEditSimple   = new ToggleButton("Editor Simple", false);
+  
 
   String activeDecoder = "binaural";   // stato attivo
   boolean editorOpen = false;          // editor del decoder corrente aperto?
@@ -19,13 +20,25 @@ class SettingsScreen {
 
   SettingsScreen(OscBridge osc) { this.osc = osc; }
 
+// Sostituisci l'intera funzione setActiveDecoder con questa:
+
   void setActiveDecoder(String t) {
     if (t == null) return;
     t = t.toLowerCase();
-    if (!(t.equals("simple") || t.equals("binaural"))) t = "binaural";
-    activeDecoder = t;
+    
+    // --- CORREZIONE QUI ---
+    // SuperCollider risponde con "simpledecoder" o "binauraldecoder".
+    // Dobbiamo mapparli correttamente alle stringhe brevi "simple" e "binaural" usate dalla GUI.
+    if (t.contains("simple")) {
+      activeDecoder = "simple";
+    } else if (t.contains("binaural")) {
+      activeDecoder = "binaural";
+    } else {
+      // Fallback
+      activeDecoder = "binaural";
+    }
 
-    // Se avevamo chiesto di aprire editor dopo lo switch
+    // Logica per l'apertura automatica dell'editor dopo lo switch
     if (pendingEditorAfterSwitch != null && pendingEditorAfterSwitch.equals(activeDecoder)) {
       if (osc != null) osc.decoderEditor(true);
       editorOpen = true;
