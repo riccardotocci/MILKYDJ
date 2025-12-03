@@ -2,7 +2,8 @@
 
 <div align="center">
 
-![demo_milkydj](https://github.com/user-attachments/assets/17f1c23e-67b4-4601-932c-2b3a5def406e)
+
+<img width="1200" height="860" alt="Gemini_Generated_Image_z2mk9cz2mk9cz2mk" src="https://github.com/user-attachments/assets/2a1d4d7e-03da-4bac-814a-8d21bfc71c6a" />
 
 
 </div>
@@ -247,6 +248,11 @@ Server.default.options. numOutputBusChannels = 8;  // Adjust for your setup
 | `/analysis/onset_times_chunk` | Onset time data |
 | `/analysis/onset_strength_chunk` | Velocity/strength data |
 | `/analysis/onset_contrast_chunk` | Spectral contrast data |
+
+---
+## DEMO
+
+![demo_milkydj](https://github.com/user-attachments/assets/17f1c23e-67b4-4601-932c-2b3a5def406e)
 
 ---
 
