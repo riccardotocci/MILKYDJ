@@ -2,10 +2,8 @@
 
 <div align="center">
 
-<!-- Placeholder per video demo: sostituisci YOUR_VIDEO_ID con l'ID del tuo video YouTube -->
-[![Demo Video](https://img.youtube.com/vi/YOUR_VIDEO_ID/maxresdefault.jpg)](https://www. youtube.com/watch?v=YOUR_VIDEO_ID)
+![demo_milkydj](https://github.com/user-attachments/assets/17f1c23e-67b4-4601-932c-2b3a5def406e)
 
-**▶️ Click the image above to watch the demo** You can listen to it in binaural with headphones!
 
 </div>
 
