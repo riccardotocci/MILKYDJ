@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist>
+  <dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>LookaheadDJ uses audio input only when you enable an input device in Audio &amp; MIDI Settings.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>LookaheadDJ uses Bluetooth to discover and configure audio and MIDI devices.</string>
+    <key>CFBundleExecutable</key>
+    <string>${EXECUTABLE_NAME}</string>
+    <key>CFBundleIconFile</key>
+    <string>Icon.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.yourcompany.lookaheadDJ</string>
+    <key>CFBundleName</key>
+    <string>lookaheadDJ</string>
+    <key>CFBundleDisplayName</key>
+    <string>lookaheadDJ</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string></string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+  </dict>
+</plist>

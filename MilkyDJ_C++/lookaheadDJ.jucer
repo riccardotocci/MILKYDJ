@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<JUCERPROJECT id="c6mFGO" name="lookaheadDJ" projectType="guiapp" useAppConfig="0"
+              addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1" headerPath="$(PROJECT_DIR)/Source/ThirdParty/onnxruntime/include&#10;/opt/homebrew/include">
+  <MAINGROUP id="pm6czi" name="lookaheadDJ">
+    <GROUP id="{CC776F85-047E-0C4E-D076-D1291B27815D}" name="Source">
+      <FILE id="ambEncH" name="AmbisonicStemEncoder.h" compile="0" resource="0"
+            file="Source/AmbisonicStemEncoder.h"/>
+      <FILE id="ambEncC" name="AmbisonicStemEncoder.cpp" compile="1" resource="0"
+            file="Source/AmbisonicStemEncoder.cpp"/>
+      <FILE id="ambDecH" name="AmbisonicConfigDecoder.h" compile="0" resource="0"
+            file="Source/AmbisonicConfigDecoder.h"/>
+      <FILE id="ambDecC" name="AmbisonicConfigDecoder.cpp" compile="1" resource="0"
+            file="Source/AmbisonicConfigDecoder.cpp"/>
+      <FILE id="binMonH" name="BinauralMonitorDecoder.h" compile="0" resource="0"
+            file="Source/BinauralMonitorDecoder.h"/>
+      <FILE id="binMonC" name="BinauralMonitorDecoder.cpp" compile="1" resource="0"
+            file="Source/BinauralMonitorDecoder.cpp"/>
+      <FILE id="eneMetH" name="AmbisonicEnergyMeter.h" compile="0" resource="0"
+            file="Source/AmbisonicEnergyMeter.h"/>
+      <FILE id="eneMetC" name="AmbisonicEnergyMeter.cpp" compile="1" resource="0"
+            file="Source/AmbisonicEnergyMeter.cpp"/>
+      <FILE id="eneVisH" name="EnergyVisualizerComponent.h" compile="0" resource="0"
+            file="Source/EnergyVisualizerComponent.h"/>
+      <FILE id="eneVisC" name="EnergyVisualizerComponent.cpp" compile="1" resource="0"
+            file="Source/EnergyVisualizerComponent.cpp"/>
+      <FILE id="spaMixH" name="SpatialMixerComponent.h" compile="0" resource="0"
+            file="Source/SpatialMixerComponent.h"/>
+      <FILE id="mlkLogo" name="MilkyLogoComponent.h" compile="0" resource="0"
+            file="Source/MilkyLogoComponent.h"/>
+      <FILE id="mlkIcon" name="MilkyDJAppIcon.svg" compile="0" resource="0"
+            file="Source/Assets/MilkyDJAppIcon.svg"/>
+      <FILE id="vertSvg" name="verticalKnob.svg" compile="0" resource="1"
+            file="Source/Assets/verticalKnob.svg"/>
+      <FILE id="horizSvg" name="horizontalKnob.svg" compile="0" resource="1"
+            file="Source/Assets/horizontalKnob.svg"/>
+      <FILE id="spaMixC" name="SpatialMixerComponent.cpp" compile="1" resource="0"
+            file="Source/SpatialMixerComponent.cpp"/>
+      <FILE id="iemShEv" name="efficientSHvanilla.cpp" compile="1" resource="0"
+            file="../resources/efficientSHvanilla.cpp"/>
+      <FILE id="yPtkPn" name="JogWheelComponent.h" compile="0" resource="0"
+            file="Source/JogWheelComponent.h"/>
+      <FILE id="obSb72" name="JogWheelComponent.cpp" compile="1" resource="0"
+            file="Source/JogWheelComponent.cpp"/>
+      <FILE id="qY6oeM" name="AudioEngine.cpp" compile="1" resource="0" file="Source/AudioEngine.cpp"/>
+      <FILE id="fal9IK" name="AudioEngine.h" compile="0" resource="0" file="Source/AudioEngine.h"/>
+      <FILE id="QRSfWv" name="BrowserComponent.cpp" compile="1" resource="0"
+            file="Source/BrowserComponent.cpp"/>
+      <FILE id="Bghtc7" name="BrowserComponent.h" compile="0" resource="0"
+            file="Source/BrowserComponent.h"/>
+      <FILE id="HP6Foy" name="Deck.cpp" compile="1" resource="0" file="Source/Deck.cpp"/>
+      <FILE id="gILNqz" name="Deck.h" compile="0" resource="0" file="Source/Deck.h"/>
+      <FILE id="d5sdX5" name="DeckComponent.cpp" compile="1" resource="0"
+            file="Source/DeckComponent.cpp"/>
+      <FILE id="qd2tEq" name="DeckComponent.h" compile="0" resource="0" file="Source/DeckComponent.h"/>
+      <FILE id="apOPnX" name="LookaheadBuffer.cpp" compile="1" resource="0"
+            file="Source/LookaheadBuffer.cpp"/>
+      <FILE id="Oi0hAz" name="LookaheadBuffer.h" compile="0" resource="0"
+            file="Source/LookaheadBuffer.h"/>
+      <FILE id="grrvuU" name="Main.cpp" compile="1" resource="0" file="Source/Main.cpp"/>
+      <FILE id="BOffdu" name="MainComponent.cpp" compile="1" resource="0"
+            file="Source/MainComponent.cpp"/>
+      <FILE id="SSX77v" name="MainComponent.h" compile="0" resource="0" file="Source/MainComponent.h"/>
+      <FILE id="tkrgyh" name="MixerComponent.cpp" compile="1" resource="0"
+            file="Source/MixerComponent.cpp"/>
+      <FILE id="ZM8BhF" name="MixerComponent.h" compile="0" resource="0"
+            file="Source/MixerComponent.h"/>
+      <FILE id="herc200c" name="HerculesInpulse200Midi.cpp" compile="1" resource="0"
+            file="Source/HerculesInpulse200Midi.cpp"/>
+      <FILE id="herc200h" name="HerculesInpulse200Midi.h" compile="0" resource="0"
+            file="Source/HerculesInpulse200Midi.h"/>
+      <FILE id="RyJN1p" name="DJLookAndFeel.cpp" compile="1" resource="0"
+            file="Source/DJLookAndFeel.cpp"/>
+      <FILE id="Yuhx28" name="DJLookAndFeel.h" compile="0" resource="0" file="Source/DJLookAndFeel.h"/>
+      <FILE id="bpma001" name="BpmAnalyzer.h" compile="0" resource="0" file="Source/BpmAnalyzer.h"/>
+      <FILE id="OFMi4z" name="OnnxSeparator.h" compile="0" resource="0" file="Source/OnnxSeparator.h"/>
+      <FILE id="cYySi6" name="VUMeter.cpp" compile="1" resource="0" file="Source/VUMeter.cpp"/>
+      <FILE id="cyqurv" name="GlobalWaveformComponent.cpp" compile="1" resource="0"
+            file="Source/GlobalWaveformComponent.cpp"/>
+      <FILE id="CcbBgt" name="SeparationWorker.cpp" compile="1" resource="0"
+            file="Source/SeparationWorker.cpp"/>
+      <FILE id="YpzmGj" name="GlobalWaveformComponent.h" compile="0" resource="0"
+            file="Source/GlobalWaveformComponent.h"/>
+      <FILE id="cqixyq" name="SeparationWorker.h" compile="0" resource="0"
+            file="Source/SeparationWorker.h"/>
+      <FILE id="QPaH7A" name="TrackDecoder.h" compile="0" resource="0" file="Source/TrackDecoder.h"/>
+      <FILE id="BpeJVW" name="VUMeter.h" compile="0" resource="0" file="Source/VUMeter.h"/>
+      <GROUP id="binIRs" name="Binaural IRs">
+        <FILE id="binIR1" name="irsOrd1.wav" compile="0" resource="1"
+              file="../BinauralDecoder/Source/IRs/irsOrd1.wav"/>
+        <FILE id="binIR2" name="irsOrd2.wav" compile="0" resource="1"
+              file="../BinauralDecoder/Source/IRs/irsOrd2.wav"/>
+        <FILE id="binIR3" name="irsOrd3.wav" compile="0" resource="1"
+              file="../BinauralDecoder/Source/IRs/irsOrd3.wav"/>
+        <FILE id="binIR4" name="irsOrd4.wav" compile="0" resource="1"
+              file="../BinauralDecoder/Source/IRs/irsOrd4.wav"/>
+        <FILE id="binIR5" name="irsOrd5.wav" compile="0" resource="1"
+              file="../BinauralDecoder/Source/IRs/irsOrd5.wav"/>
+        <FILE id="binIR6" name="irsOrd6.wav" compile="0" resource="1"
+              file="../BinauralDecoder/Source/IRs/irsOrd6.wav"/>
+        <FILE id="binIR7" name="irsOrd7.wav" compile="0" resource="1"
+              file="../BinauralDecoder/Source/IRs/irsOrd7.wav"/>
+      </GROUP>
+    </GROUP>
+  </MAINGROUP>
+  <MODULES>
+      <MODULE id="juce_audio_basics" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+      <MODULE id="juce_audio_devices" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+      <MODULE id="juce_audio_formats" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+      <MODULE id="juce_audio_processors" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+    <MODULE id="juce_audio_processors_headless" showAllCode="1" useLocalCopy="0"
+                useGlobalPath="0"/>
+          <MODULE id="juce_audio_utils" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+          <MODULE id="juce_core" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+          <MODULE id="juce_data_structures" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+          <MODULE id="juce_dsp" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+          <MODULE id="juce_events" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+          <MODULE id="juce_graphics" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+          <MODULE id="juce_gui_basics" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+          <MODULE id="juce_gui_extra" showAllCode="1" useLocalCopy="0" useGlobalPath="0"/>
+  </MODULES>
+  <JUCEOPTIONS JUCE_STRICT_REFCOUNTEDPOINTER="1"/>
+  <EXPORTFORMATS>
+      <XCODE_MAC targetFolder="Builds/MacOSX" externalLibraries="onnxruntime"
+                     smallIcon="mlkIcon" bigIcon="mlkIcon"
+                     extraLinkerFlags="-Wl,-rpath,@executable_path/../Frameworks&#10;-laubio"
+                     microphonePermissionNeeded="1"
+                     microphonePermissionsText="LookaheadDJ uses audio input only when you enable an input device in Audio &amp; MIDI Settings."
+                     iosBluetoothPermissionNeeded="1"
+                     iosBluetoothPermissionText="LookaheadDJ uses Bluetooth to discover and configure audio and MIDI devices.">
+      <CONFIGURATIONS>
+        <CONFIGURATION isDebug="1" name="Debug" targetName="lookaheadDJ" headerPath="/Users/riccardotocci/Desktop/milkydj_cpiupiu/lookaheadDJ/Source/ThirdParty/onnxruntime/include&#10;/opt/homebrew/include"
+                       libraryPath="/Users/riccardotocci/Desktop/milkydj_cpiupiu/lookaheadDJ/Source/ThirdParty/onnxruntime/lib&#10;/opt/homebrew/lib"/>
+        <CONFIGURATION isDebug="0" name="Release" targetName="lookaheadDJ" headerPath="/Users/riccardotocci/Desktop/milkydj_cpiupiu/lookaheadDJ/Source/ThirdParty/onnxruntime/include&#10;/opt/homebrew/include"
+                       libraryPath="/Users/riccardotocci/Desktop/milkydj_cpiupiu/lookaheadDJ/Source/ThirdParty/onnxruntime/lib&#10;/opt/homebrew/lib&#10;"/>
+      </CONFIGURATIONS>
+      <MODULEPATHS>
+      <MODULEPATH id="juce_audio_basics" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_audio_devices" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_audio_formats" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_audio_utils" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_core" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_data_structures" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_dsp" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_events" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_graphics" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_gui_basics" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_gui_extra" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_audio_processors" path="../JUCE/modules"/>
+      <MODULEPATH id="juce_audio_processors_headless" path="../JUCE/modules"/>
+      </MODULEPATHS>
+    </XCODE_MAC>
+  </EXPORTFORMATS>
+</JUCERPROJECT>
